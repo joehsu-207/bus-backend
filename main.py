@@ -1,7 +1,8 @@
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI
+from fastapi import FastAPI,Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 
@@ -12,6 +13,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+def fetch_tdx_json(url: str, headers: dict, retries: int = 2):
+    for attempt in range(retries + 1):
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code == 429 and attempt < retries:
+            time.sleep(1.2)
+            continue
+        res.raise_for_status()
+        return res.json()
 
 CLIENT_ID = os.environ.get("TDX_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("TDX_CLIENT_SECRET")
@@ -75,9 +92,9 @@ def get_accurate_bus(city: str, route_name: str):
 
     headers = {"authorization": f"Bearer {get_token()}", "Accept-Encoding": "gzip"}
 
-    stops_res = requests.get(build_tdx_url("StopOfRoute", city, route_name), headers=headers).json()
-    eta_res = requests.get(build_tdx_url("EstimatedTimeOfArrival", city, route_name), headers=headers).json()
-    near_res = requests.get(build_tdx_url("RealTimeNearStop", city, route_name), headers=headers).json()
+    stops_res = fetch_tdx_json(build_tdx_url("StopOfRoute", city, route_name), headers)
+    eta_res = fetch_tdx_json(build_tdx_url("EstimatedTimeOfArrival", city, route_name), headers)
+    near_res = fetch_tdx_json(build_tdx_url("RealTimeNearStop", city, route_name), headers)
     tt_res = get_timetable_cached(city, route_name, headers)
 
     vehicles = {0: [], 1: []}
