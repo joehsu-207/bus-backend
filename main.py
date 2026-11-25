@@ -23,12 +23,20 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 def fetch_tdx_json(url: str, headers: dict, retries: int = 2):
     for attempt in range(retries + 1):
+        time.sleep(0.4)
         res = requests.get(url, headers=headers, timeout=15)
         if res.status_code == 429 and attempt < retries:
-            time.sleep(1.2)
+            time.sleep(2.0 * (attempt + 1))
             continue
         res.raise_for_status()
         return res.json()
+def get_stops_cached(city: str, route_name: str, headers: dict):
+    key = f"{city}_{route_name}"
+    if key in stops_cache:
+        return stops_cache[key]
+    data = fetch_tdx_json(build_tdx_url("StopOfRoute", city, route_name), headers)
+    stops_cache[key] = data
+    return data
 
 CLIENT_ID = os.environ.get("TDX_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("TDX_CLIENT_SECRET")
@@ -37,6 +45,7 @@ TW_TZ = timezone(timedelta(hours=8))
 token_cache = {"access_token": None, "expires_at": 0}
 route_cache = {}
 timetable_cache = {}
+stops_cache = {}
 
 
 def get_token():
@@ -87,12 +96,12 @@ def get_accurate_bus(city: str, route_name: str):
     now_ts = time.time()
     now_tw = datetime.now(TW_TZ)
 
-    if cache_key in route_cache and now_ts - route_cache[cache_key]["ts"] < 10:
+    if cache_key in route_cache and now_ts - route_cache[cache_key]["ts"] < 25:
         return route_cache[cache_key]["payload"]
 
     headers = {"authorization": f"Bearer {get_token()}", "Accept-Encoding": "gzip"}
 
-    stops_res = fetch_tdx_json(build_tdx_url("StopOfRoute", city, route_name), headers)
+    stops_res = get_stops_cached(city, route_name, headers)
     eta_res = fetch_tdx_json(build_tdx_url("EstimatedTimeOfArrival", city, route_name), headers)
     near_res = fetch_tdx_json(build_tdx_url("RealTimeNearStop", city, route_name), headers)
     tt_res = get_timetable_cached(city, route_name, headers)
