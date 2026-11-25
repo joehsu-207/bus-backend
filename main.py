@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -29,7 +30,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 def fetch_tdx_json(url: str, headers: dict, retries: int = 3):
     for attempt in range(retries + 1):
-        time.sleep(0.4)
+        time.sleep(0.35)
         res = requests.get(url, headers=headers, timeout=15)
         if res.status_code == 429 and attempt < retries:
             time.sleep(2.0 * (attempt + 1))
@@ -45,9 +46,25 @@ TW_TZ = timezone(timedelta(hours=8))
 token_cache = {"access_token": None, "expires_at": 0}
 route_cache = {}
 timetable_cache = {}
+schedule_cache = {}
 stops_cache = {}
 stop_routes_cache = {}
 city_network_cache = {}
+city_stops_geo_cache = {}
+youbike_station_cache = {}
+
+
+def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371000.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dp / 2) ** 2
+        + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    )
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def get_token():
@@ -90,7 +107,7 @@ def get_timetable_cached(city: str, route: str, headers: dict):
     key = f"{city}_{route}_{today}"
     if key in timetable_cache:
         return timetable_cache[key]
-    time.sleep(0.4)
+    time.sleep(0.35)
     res = requests.get(
         build_tdx_url("DailyTimetable", city, route), headers=headers, timeout=10
     )
@@ -100,7 +117,6 @@ def get_timetable_cached(city: str, route: str, headers: dict):
 
 
 def get_city_network_cached(city: str, headers: dict):
-    """快取單一縣市所有公車路線的站序拓樸（24 小時有效），用於快速計算轉乘站"""
     now_ts = time.time()
     cached = city_network_cache.get(city)
     if cached and now_ts - cached["ts"] < 86400:
@@ -136,6 +152,32 @@ def get_city_network_cached(city: str, headers: dict):
     }
     city_network_cache[city] = {"ts": now_ts, "data": network}
     return network
+
+
+def get_city_stops_geo_cached(city: str, headers: dict):
+    """快取單一縣市所有公車站牌名稱與經緯度（24 小時）"""
+    now_ts = time.time()
+    cached = city_stops_geo_cache.get(city)
+    if cached and now_ts - cached["ts"] < 86400:
+        return cached["data"]
+
+    url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/Stop/City/{city}?$select=StopName,StopPosition&$format=JSON"
+    raw_stops = fetch_tdx_json(url, headers)
+
+    grouped = {}
+    for st in raw_stops:
+        name = st.get("StopName", {}).get("Zh_tw", "")
+        pos = st.get("StopPosition", {})
+        lat = pos.get("PositionLat")
+        lon = pos.get("PositionLon")
+        if not name or lat is None or lon is None:
+            continue
+        if name not in grouped:
+            grouped[name] = {"name": name, "lat": float(lat), "lon": float(lon)}
+
+    stops_list = list(grouped.values())
+    city_stops_geo_cache[city] = {"ts": now_ts, "data": stops_list}
+    return stops_list
 
 
 @app.get("/")
@@ -283,6 +325,103 @@ def get_accurate_bus(city: str, route_name: str):
     return payload
 
 
+@app.get("/api/bus/timetable/{city}/{route_name}")
+def get_route_full_timetable(city: str, route_name: str):
+    """取得每週每日（平日／假日）完整每班發車時刻表與發車班距"""
+    cache_key = f"{city}_schedule_{route_name}"
+    now_ts = time.time()
+    if cache_key in schedule_cache and now_ts - schedule_cache[cache_key]["ts"] < 3600:
+        return schedule_cache[cache_key]["payload"]
+
+    headers = {"authorization": f"Bearer {get_token()}", "Accept-Encoding": "gzip"}
+    url = build_tdx_url("Schedule", city, route_name)
+    res = requests.get(url, headers=headers, timeout=15)
+    raw_schedules = res.json() if res.status_code == 200 else []
+
+    day_keys = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ]
+    result = {
+        "0": {d: {"times": [], "frequencies": []} for d in day_keys},
+        "1": {d: {"times": [], "frequencies": []} for d in day_keys},
+    }
+
+    for item in raw_schedules:
+        d_str = str(item.get("Direction", 0))
+        if d_str not in result:
+            continue
+
+        # 固定班表 Timetables
+        for tt in item.get("Timetables", []):
+            service_day = tt.get("ServiceDay", {})
+            st_list = tt.get("StopTimes", [])
+            if not st_list:
+                continue
+            dep_time = st_list[0].get("DepartureTime", "")
+            if not dep_time:
+                continue
+            for dk in day_keys:
+                if service_day.get(dk, 0) == 1:
+                    if dep_time not in result[d_str][dk]["times"]:
+                        result[d_str][dk]["times"].append(dep_time)
+
+        # 班距型路線 Frequencys
+        for fq in item.get("Frequencys", []):
+            service_day = fq.get("ServiceDay", {})
+            start_t = fq.get("StartTime", "")
+            end_t = fq.get("EndTime", "")
+            min_h = fq.get("MinHeadwayMins", "")
+            max_h = fq.get("MaxHeadwayMins", "")
+            if not start_t or not end_t:
+                continue
+            headway_text = (
+                f"{min_h} 分"
+                if min_h == max_h
+                else f"{min_h}～{max_h} 分"
+            )
+            desc = f"{start_t} - {end_t}（約 {headway_text}一班）"
+            for dk in day_keys:
+                if service_day.get(dk, 0) == 1:
+                    if desc not in result[d_str][dk]["frequencies"]:
+                        result[d_str][dk]["frequencies"].append(desc)
+
+    # 若 Schedule 無資料，備援讀取今日 DailyTimetable
+    has_any = any(
+        result[d][dk]["times"] or result[d][dk]["frequencies"]
+        for d in ["0", "1"]
+        for dk in day_keys
+    )
+    if not has_any:
+        daily = get_timetable_cached(city, route_name, headers)
+        for item in daily:
+            d_str = str(item.get("Direction", 0))
+            if d_str not in result:
+                continue
+            for tt in item.get("Timetables", []):
+                st_list = tt.get("StopTimes", [])
+                if not st_list:
+                    continue
+                dep_time = st_list[0].get("DepartureTime", "")
+                if dep_time:
+                    for dk in day_keys:
+                        if dep_time not in result[d_str][dk]["times"]:
+                            result[d_str][dk]["times"].append(dep_time)
+
+    for d in ["0", "1"]:
+        for dk in day_keys:
+            result[d][dk]["times"].sort()
+
+    payload = {"routeName": route_name, "directions": result}
+    schedule_cache[cache_key] = {"ts": now_ts, "payload": payload}
+    return payload
+
+
 @app.get("/api/bus/stop/{city}/{stop_name}")
 def get_other_routes_at_stop(city: str, stop_name: str):
     cache_key = f"{city}_stop_{stop_name}"
@@ -345,6 +484,102 @@ def get_other_routes_at_stop(city: str, stop_name: str):
     return payload
 
 
+@app.get("/api/bus/nearby/{city}")
+def get_nearby_bus_stops(city: str, lat: float, lon: float, radius: int = 450):
+    """根據 GPS 經緯度找出方圓 radius 公尺內最近的公車站牌"""
+    headers = {"authorization": f"Bearer {get_token()}", "Accept-Encoding": "gzip"}
+    stops_geo = get_city_stops_geo_cached(city, headers)
+
+    nearby = []
+    for st in stops_geo:
+        dist = haversine_meters(lat, lon, st["lat"], st["lon"])
+        if dist <= radius:
+            nearby.append(
+                {
+                    "name": st["name"],
+                    "distanceMeters": int(round(dist)),
+                    "lat": st["lat"],
+                    "lon": st["lon"],
+                }
+            )
+
+    nearby.sort(key=lambda x: x["distanceMeters"])
+    return {"stops": nearby[:12]}
+
+
+@app.get("/api/youbike/nearby/{city}")
+def get_nearby_youbike(city: str, stop_name: str, radius: int = 300):
+    """查詢指定公車站牌方圓 300 公尺內的 YouBike 2.0 即時可借／可還數量"""
+    headers = {"authorization": f"Bearer {get_token()}", "Accept-Encoding": "gzip"}
+    stops_geo = get_city_stops_geo_cached(city, headers)
+
+    target = next((s for s in stops_geo if s["name"] == stop_name), None)
+    if target is None:
+        target = next(
+            (s for s in stops_geo if stop_name in s["name"] or s["name"] in stop_name),
+            None,
+        )
+    if target is None:
+        return {"stopName": stop_name, "stations": []}
+
+    # 站點基本資料快取 24 小時
+    now_ts = time.time()
+    cached_st = youbike_station_cache.get(city)
+    if cached_st and now_ts - cached_st["ts"] < 86400:
+        stations_map = cached_st["data"]
+    else:
+        st_url = f"https://tdx.transportdata.tw/api/basic/v2/Bike/Station/City/{city}?$select=StationUID,StationName,StationPosition&$format=JSON"
+        st_res = requests.get(st_url, headers=headers, timeout=15)
+        raw_st = st_res.json() if st_res.status_code == 200 else []
+        stations_map = {}
+        for item in raw_st:
+            uid = item.get("StationUID")
+            pos = item.get("StationPosition", {})
+            if uid and pos.get("PositionLat") and pos.get("PositionLon"):
+                stations_map[uid] = {
+                    "uid": uid,
+                    "name": item.get("StationName", {})
+                    .get("Zh_tw", "")
+                    .replace("YouBike2.0_", ""),
+                    "lat": float(pos["PositionLat"]),
+                    "lon": float(pos["PositionLon"]),
+                }
+        youbike_station_cache[city] = {"ts": now_ts, "data": stations_map}
+
+    # 篩選方圓 radius 公尺內的 YouBike 站點
+    candidates = {}
+    for uid, info in stations_map.items():
+        dist = haversine_meters(target["lat"], target["lon"], info["lat"], info["lon"])
+        if dist <= radius:
+            candidates[uid] = {**info, "distanceMeters": int(round(dist))}
+
+    if not candidates:
+        return {"stopName": stop_name, "stations": []}
+
+    # 即時抓取可借可還車位
+    av_url = f"https://tdx.transportdata.tw/api/basic/v2/Bike/Availability/City/{city}?$select=StationUID,AvailableRentBikes,AvailableReturnBikes,ServiceStatus&$format=JSON"
+    av_res = requests.get(av_url, headers=headers, timeout=15)
+    raw_av = av_res.json() if av_res.status_code == 200 else []
+
+    results = []
+    for av in raw_av:
+        uid = av.get("StationUID")
+        if uid in candidates:
+            info = candidates[uid]
+            results.append(
+                {
+                    "name": info["name"],
+                    "distanceMeters": info["distanceMeters"],
+                    "rentBikes": av.get("AvailableRentBikes", 0),
+                    "returnSpaces": av.get("AvailableReturnBikes", 0),
+                    "serviceStatus": av.get("ServiceStatus", 1),
+                }
+            )
+
+    results.sort(key=lambda x: x["distanceMeters"])
+    return {"stopName": stop_name, "stations": results[:8]}
+
+
 @app.get("/api/bus/transfer/{city}")
 def get_transfer_alternatives(
     city: str, origin: str, destination: str, exclude_route: str = ""
@@ -358,7 +593,6 @@ def get_transfer_alternatives(
     origin_clean = origin.strip()
     dest_clean = destination.strip()
 
-    # 支援模糊比對目的地站名
     matched_dest_stops = [
         s for s in stop_to_routes.keys() if dest_clean in s or s in dest_clean
     ]
@@ -374,7 +608,6 @@ def get_transfer_alternatives(
             "transfers": [],
         }
 
-    # 取得起點站所有公車的即時到站秒數
     eta_lookup = {}
     try:
         escaped_origin = origin_clean.replace("'", "''")
@@ -404,7 +637,6 @@ def get_transfer_alternatives(
     except Exception:
         pass
 
-    # 1. 尋找其他直達路線（排除剛錯過的 exclude_route）
     direct_options = []
     seen_direct = set()
     for r_name, direction, o_idx in origin_entries:
@@ -438,7 +670,6 @@ def get_transfer_alternatives(
         )
     )
 
-    # 2. 尋找一次轉乘替代路線（第一段路線 A -> 轉乘站 -> 第二段路線 B 到達目的地）
     dest_route_map = {}
     for d_stop in matched_dest_stops:
         for r2, dir2, d2_idx in stop_to_routes.get(d_stop, []):
@@ -457,8 +688,7 @@ def get_transfer_alternatives(
                         "targetStop": d_stop,
                     }
 
-    transfer_candidates = []
-    seen_transfer_pair = set()
+    seen_transfer_pair = {}
     for r1, dir1, o1_idx in origin_entries:
         if exclude_route and r1 == exclude_route:
             continue
