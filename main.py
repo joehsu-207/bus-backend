@@ -1,18 +1,23 @@
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI,Request
+from urllib.parse import quote
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
@@ -21,7 +26,8 @@ async def global_exception_handler(request: Request, exc: Exception):
         headers={"Access-Control-Allow-Origin": "*"},
     )
 
-def fetch_tdx_json(url: str, headers: dict, retries: int = 2):
+
+def fetch_tdx_json(url: str, headers: dict, retries: int = 3):
     for attempt in range(retries + 1):
         time.sleep(0.4)
         res = requests.get(url, headers=headers, timeout=15)
@@ -30,13 +36,7 @@ def fetch_tdx_json(url: str, headers: dict, retries: int = 2):
             continue
         res.raise_for_status()
         return res.json()
-def get_stops_cached(city: str, route_name: str, headers: dict):
-    key = f"{city}_{route_name}"
-    if key in stops_cache:
-        return stops_cache[key]
-    data = fetch_tdx_json(build_tdx_url("StopOfRoute", city, route_name), headers)
-    stops_cache[key] = data
-    return data
+
 
 CLIENT_ID = os.environ.get("TDX_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("TDX_CLIENT_SECRET")
@@ -46,6 +46,7 @@ token_cache = {"access_token": None, "expires_at": 0}
 route_cache = {}
 timetable_cache = {}
 stops_cache = {}
+stop_routes_cache = {}
 
 
 def get_token():
@@ -74,12 +75,24 @@ def build_tdx_url(endpoint: str, city: str, route: str):
     return f"https://tdx.transportdata.tw/api/basic/v2/Bus/{endpoint}/City/{city}/{route}?$filter=RouteName/Zh_tw eq '{route}'&$format=JSON"
 
 
+def get_stops_cached(city: str, route_name: str, headers: dict):
+    key = f"{city}_{route_name}"
+    if key in stops_cache:
+        return stops_cache[key]
+    data = fetch_tdx_json(build_tdx_url("StopOfRoute", city, route_name), headers)
+    stops_cache[key] = data
+    return data
+
+
 def get_timetable_cached(city: str, route: str, headers: dict):
     today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
     key = f"{city}_{route}_{today}"
     if key in timetable_cache:
         return timetable_cache[key]
-    res = requests.get(build_tdx_url("DailyTimeTable", city, route), headers=headers, timeout=10)
+    time.sleep(0.4)
+    res = requests.get(
+        build_tdx_url("DailyTimetable", city, route), headers=headers, timeout=10
+    )
     data = res.json() if res.status_code == 200 else []
     timetable_cache[key] = data
     return data
@@ -102,19 +115,25 @@ def get_accurate_bus(city: str, route_name: str):
     headers = {"authorization": f"Bearer {get_token()}", "Accept-Encoding": "gzip"}
 
     stops_res = get_stops_cached(city, route_name, headers)
-    eta_res = fetch_tdx_json(build_tdx_url("EstimatedTimeOfArrival", city, route_name), headers)
-    near_res = fetch_tdx_json(build_tdx_url("RealTimeNearStop", city, route_name), headers)
+    eta_res = fetch_tdx_json(
+        build_tdx_url("EstimatedTimeOfArrival", city, route_name), headers
+    )
+    near_res = fetch_tdx_json(
+        build_tdx_url("RealTimeNearStop", city, route_name), headers
+    )
     tt_res = get_timetable_cached(city, route_name, headers)
 
     vehicles = {0: [], 1: []}
     for v in near_res:
         d = v.get("Direction")
         if d in vehicles and v.get("DutyStatus") != 2:
-            vehicles[d].append({
-                "plate": v.get("PlateNumb", "行駛中"),
-                "seq": v.get("StopSequence", 1),
-                "stopName": v.get("StopName", {}).get("Zh_tw", ""),
-            })
+            vehicles[d].append(
+                {
+                    "plate": v.get("PlateNumb", "行駛中"),
+                    "seq": v.get("StopSequence", 1),
+                    "stopName": v.get("StopName", {}).get("Zh_tw", ""),
+                }
+            )
 
     eta_map = {0: {}, 1: {}}
     max_latency = 0
@@ -133,7 +152,9 @@ def get_accurate_bus(city: str, route_name: str):
                 max_latency = max(max_latency, age)
             except ValueError:
                 pass
-        comp_sec = max(0, raw_sec - age) if (status == 0 and raw_sec is not None) else None
+        comp_sec = (
+            max(0, raw_sec - age) if (status == 0 and raw_sec is not None) else None
+        )
         eta_map[d][seq] = {"status": status, "sec": comp_sec}
 
     missed_list = []
@@ -152,7 +173,9 @@ def get_accurate_bus(city: str, route_name: str):
             diff_min = int((now_tw - dep_dt).total_seconds() // 60)
             if 5 <= diff_min <= 25:
                 if not any(b["seq"] <= 4 for b in vehicles.get(d, [])):
-                    missed_list.append(f"{route_name}路({dir_label}) 表定 {dep_str} 班次已逾時 {diff_min} 分鐘未發車")
+                    missed_list.append(
+                        f"{route_name}路({dir_label}) 表定 {dep_str} 班次已逾時 {diff_min} 分鐘未發車"
+                    )
 
     dirs_result = {0: [], 1: []}
     for r in stops_res:
@@ -163,33 +186,120 @@ def get_accurate_bus(city: str, route_name: str):
         active_buses = vehicles[d]
 
         for s in r.get("Stops", []):
-            seq = s.get("StopSequence")
+            seq = s["StopSequence"]
             name = s["StopName"]["Zh_tw"]
             base = seq_eta.get(seq, {"status": 1, "sec": None})
             buses_here = [b["plate"] for b in active_buses if b["seq"] == seq]
 
-            approaching = sorted([b for b in active_buses if b["seq"] <= seq], key=lambda x: x["seq"], reverse=True)
+            approaching = sorted(
+                [b for b in active_buses if b["seq"] < seq],
+                key=lambda x: x["seq"],
+                reverse=True,
+            )
             timeline = []
             for idx, bus in enumerate(approaching):
                 if idx == 0 and base["status"] == 0 and base["sec"] is not None:
                     rem = base["sec"]
                 else:
-                    b_eta = seq_eta.get(bus["seq"], {}).get("sec") or ((bus["seq"] - 1) * 85)
-                    t_eta = base["sec"] or ((seq - 1) * 85)
-                    rem = max(30, t_eta - b_eta)
-                timeline.append({"plate": bus["plate"], "currentStop": bus["stopName"], "remSec": rem})
+                    b_eta = seq_eta.get(bus["seq"], {}).get("sec") or (
+                        (bus["seq"] - 1) * 90
+                    )
+                    t_eta = base["sec"] or ((seq - 1) * 90)
+                    rem = max(60, t_eta - b_eta)
+                timeline.append(
+                    {
+                        "plate": bus["plate"],
+                        "currentStop": bus["stopName"],
+                        "remSec": rem,
+                    }
+                )
 
             if not timeline and base["status"] == 0 and base["sec"] is not None:
-                timeline.append({"plate": "即將發車", "currentStop": "總站準備中", "remSec": base["sec"]})
+                timeline.append(
+                    {
+                        "plate": "即將發車",
+                        "currentStop": "起站準備中",
+                        "remSec": base["sec"],
+                    }
+                )
 
-            dirs_result[d].append({
-                "seq": seq,
-                "name": name,
-                "status": base["status"],
-                "busesHere": buses_here,
-                "buses": timeline,
-            })
+            dirs_result[d].append(
+                {
+                    "seq": seq,
+                    "name": name,
+                    "status": base["status"],
+                    "busesHere": buses_here,
+                    "buses": timeline,
+                }
+            )
 
-    payload = {"0": dirs_result[0], "1": dirs_result[1], "missedAlerts": missed_list, "maxLatencySec": max_latency}
+    payload = {
+        "0": dirs_result[0],
+        "1": dirs_result[1],
+        "missedAlerts": missed_list,
+        "maxLatencySec": max_latency,
+    }
     route_cache[cache_key] = {"ts": now_ts, "payload": payload}
+    return payload
+
+
+@app.get("/api/bus/stop/{city}/{stop_name}")
+def get_other_routes_at_stop(city: str, stop_name: str):
+    cache_key = f"{city}_stop_{stop_name}"
+    now_ts = time.time()
+    now_tw = datetime.now(TW_TZ)
+
+    if cache_key in stop_routes_cache and now_ts - stop_routes_cache[cache_key]["ts"] < 20:
+        return stop_routes_cache[cache_key]["payload"]
+
+    headers = {"authorization": f"Bearer {get_token()}", "Accept-Encoding": "gzip"}
+    escaped_name = stop_name.replace("'", "''")
+    filter_expr = quote(f"StopName/Zh_tw eq '{escaped_name}'")
+    url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/{city}?$filter={filter_expr}&$format=JSON"
+
+    eta_list = fetch_tdx_json(url, headers)
+
+    grouped = {}
+    for item in eta_list:
+        r_name = item.get("RouteName", {}).get("Zh_tw", "")
+        if not r_name:
+            continue
+        direction = item.get("Direction", 0)
+        status = item.get("StopStatus", 1)
+        raw_sec = item.get("EstimateTime")
+        age = 0
+        if item.get("SrcUpdateTime"):
+            try:
+                src_dt = datetime.fromisoformat(item["SrcUpdateTime"])
+                age = max(0, int((now_tw - src_dt).total_seconds()))
+            except ValueError:
+                pass
+        comp_sec = (
+            max(0, raw_sec - age) if (status == 0 and raw_sec is not None) else None
+        )
+
+        key = f"{r_name}_{direction}"
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = {
+                "routeName": r_name,
+                "direction": direction,
+                "status": status,
+                "remSec": comp_sec,
+            }
+        else:
+            if comp_sec is not None and (
+                existing["remSec"] is None or comp_sec < existing["remSec"]
+            ):
+                existing["status"] = 0
+                existing["remSec"] = comp_sec
+
+    def sort_key(x):
+        if x["status"] == 0 and x["remSec"] is not None:
+            return (0, x["remSec"], x["routeName"])
+        return (1, 999999, x["routeName"])
+
+    routes_sorted = sorted(grouped.values(), key=sort_key)
+    payload = {"stopName": stop_name, "routes": routes_sorted}
+    stop_routes_cache[cache_key] = {"ts": now_ts, "payload": payload}
     return payload
