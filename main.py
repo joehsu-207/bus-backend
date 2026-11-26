@@ -40,7 +40,6 @@ http_session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
 http_session.mount("https://", adapter)
 
-# 全局 TDX 節流閥：確保每次呼叫 TDX API 至少間隔 0.65 秒，徹底避免 429 QPS 限流
 _tdx_rate_lock = threading.Lock()
 _last_tdx_call_ts = 0.0
 MIN_TDX_INTERVAL_SEC = 0.65
@@ -63,7 +62,11 @@ def fetch_tdx_json(url: str, headers: dict, retries: int = 4):
         if res.status_code == 429 and attempt < retries:
             retry_after = res.headers.get("Retry-After")
             try:
-                sleep_sec = max(1.8, float(retry_after)) if retry_after else (1.8 * (attempt + 1))
+                sleep_sec = (
+                    max(1.8, float(retry_after))
+                    if retry_after
+                    else (1.8 * (attempt + 1))
+                )
             except ValueError:
                 sleep_sec = 1.8 * (attempt + 1)
             time.sleep(min(sleep_sec, 8.0))
@@ -180,7 +183,6 @@ def get_stops_cached(city: str, route_name: str, headers: dict):
     if key in stops_cache and stops_cache[key]:
         return stops_cache[key]
 
-    # 優先從已快取 24 小時的全城路網中提取站序，省下一次 TDX StopOfRoute API 呼叫
     if city != "InterCity" and city in city_network_cache:
         net = city_network_cache[city]["data"]["route_dir_stops"]
         reconstructed = []
@@ -340,7 +342,6 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
     eta_url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/{city}/{route_name}?$select=Direction,StopSequence,EstimateTime,StopStatus,SrcUpdateTime&$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
     near_url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/RealTimeNearStop/City/{city}/{route_name}?$select=Direction,PlateNumb,DutyStatus,StopSequence,StopName&$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
 
-    # max_workers=1 搭配 _tdx_throttle() 依序安全請求，完全避免觸發 TDX 429 QPS 上限
     with ThreadPoolExecutor(max_workers=1) as executor:
         f_stops = executor.submit(get_stops_cached, city, route_name, headers)
         f_eta = executor.submit(fetch_tdx_json, eta_url, headers)
@@ -401,12 +402,12 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
     now_mins = now_tw.hour * 60 + now_tw.minute
     next_origin_dep = {0: None, 1: None}
     next_stop_dep = {0: {}, 1: {}}
+    origin_dep_times = {0: set(), 1: set()}
 
     for rtt in tt_res:
         d = rtt.get("Direction", 0)
         if d not in next_origin_dep:
             continue
-        dir_label = "去程" if d == 0 else "返程"
         for trip in rtt.get("Timetables", []):
             st = trip.get("StopTimes") or []
             if not st:
@@ -417,23 +418,15 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
             if ":" in dep_str:
                 try:
                     hh, mm = map(int, dep_str.split(":")[:2])
+                    fmt_t = f"{hh:02d}:{mm:02d}"
+                    origin_dep_times[d].add(fmt_t)
                     dep_mins = hh * 60 + mm
                     if dep_mins >= now_mins:
                         if (
                             next_origin_dep[d] is None
                             or dep_mins < next_origin_dep[d][0]
                         ):
-                            next_origin_dep[d] = (dep_mins, f"{hh:02d}:{mm:02d}")
-
-                    dep_dt = now_tw.replace(
-                        hour=hh % 24, minute=mm, second=0, microsecond=0
-                    )
-                    diff_min = int((now_tw - dep_dt).total_seconds() // 60)
-                    if 5 <= diff_min <= 25:
-                        if not any(b["seq"] <= 4 for b in vehicles.get(d, [])):
-                            missed_list.append(
-                                f"{route_name}路({dir_label}) 表定 {dep_str} 班次已逾時 {diff_min} 分鐘未發車"
-                            )
+                            next_origin_dep[d] = (dep_mins, fmt_t)
                 except ValueError:
                     pass
 
@@ -456,7 +449,13 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
                     except ValueError:
                         pass
 
-    if next_origin_dep[0] is None or next_origin_dep[1] is None:
+    # 若 DailyTimetable 無資料，自動從 Schedule 班表補齊今日所有起站發車時刻
+    if (
+        next_origin_dep[0] is None
+        or next_origin_dep[1] is None
+        or not origin_dep_times[0]
+        or not origin_dep_times[1]
+    ):
         sched_payload = get_schedule_cached(city, route_name, headers)
         day_keys = [
             "Monday",
@@ -470,23 +469,42 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
         today_dk = day_keys[now_tw.weekday()]
         sched_dirs = sched_payload.get("directions", {})
         for d in [0, 1]:
-            if next_origin_dep[d] is None:
-                today_times = (
-                    sched_dirs.get(str(d), {}).get(today_dk, {}).get("times", [])
-                )
-                for t_str in today_times:
-                    if ":" in t_str:
-                        try:
-                            hh, mm = map(int, t_str.split(":")[:2])
-                            dep_mins = hh * 60 + mm
-                            if dep_mins >= now_mins:
-                                next_origin_dep[d] = (
-                                    dep_mins,
-                                    f"{hh:02d}:{mm:02d}",
-                                )
-                                break
-                        except ValueError:
-                            pass
+            today_times = (
+                sched_dirs.get(str(d), {}).get(today_dk, {}).get("times", [])
+            )
+            for t_str in today_times:
+                if ":" in t_str:
+                    try:
+                        hh, mm = map(int, t_str.split(":")[:2])
+                        fmt_t = f"{hh:02d}:{mm:02d}"
+                        origin_dep_times[d].add(fmt_t)
+                        dep_mins = hh * 60 + mm
+                        if dep_mins >= now_mins:
+                            if (
+                                next_origin_dep[d] is None
+                                or dep_mins < next_origin_dep[d][0]
+                            ):
+                                next_origin_dep[d] = (dep_mins, fmt_t)
+                    except ValueError:
+                        pass
+
+    # 統一檢查今日起站時刻表是否有「時間已過 3～35 分鐘卻未發車」的脫班/誤點班次
+    overdue_dep = {0: None, 1: None}
+    for d in [0, 1]:
+        dir_label = "去程" if d == 0 else "返程"
+        has_recent_departure = any(b["seq"] <= 6 for b in vehicles.get(d, []))
+        for fmt_t in sorted(origin_dep_times[d]):
+            try:
+                hh, mm = map(int, fmt_t.split(":"))
+                dep_mins = hh * 60 + mm
+                diff_min = now_mins - dep_mins
+                if 3 <= diff_min <= 35 and not has_recent_departure:
+                    overdue_dep[d] = (fmt_t, diff_min)
+                    missed_list.append(
+                        f"{route_name}路({dir_label}) 表定 {fmt_t} 班次已逾時 {diff_min} 分鐘未照時發車"
+                    )
+            except ValueError:
+                pass
 
     dirs_result = {0: [], 1: []}
     for r in stops_res:
@@ -495,9 +513,14 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
             continue
         seq_eta = eta_map[d]
         active_buses = vehicles[d]
-        origin_next_str = (
-            f"{next_origin_dep[d][1]}發車" if next_origin_dep[d] else ""
-        )
+
+        if overdue_dep[d] is not None:
+            ov_time, ov_mins = overdue_dep[d]
+            origin_next_str = f"{ov_time}未發車(逾{ov_mins}分)"
+        elif next_origin_dep[d]:
+            origin_next_str = f"{next_origin_dep[d][1]}發車"
+        else:
+            origin_next_str = ""
 
         active_plate_set = {b["plate"] for b in active_buses}
         pure_standby = [p for p in standby_plates[d] if p not in active_plate_set]
@@ -542,7 +565,10 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
                 )
 
             stop_specific = next_stop_dep[d].get(seq)
-            next_dep_label = stop_specific[1] if stop_specific else origin_next_str
+            if overdue_dep[d] is not None and not timeline and not buses_here:
+                next_dep_label = origin_next_str
+            else:
+                next_dep_label = stop_specific[1] if stop_specific else origin_next_str
 
             dirs_result[d].append(
                 {
