@@ -25,22 +25,21 @@ app.add_middleware(
 async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
-        content={"detail": str(exc)},
+        content={"detail": f"{type(exc).__name__}: {str(exc)}"},
         headers={"Access-Control-Allow-Origin": "*"},
     )
 
 
-# 複用 TCP/TLS 連線池，省去每次重新 HTTPS 握手的 300~500ms 延遲
 http_session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
 http_session.mount("https://", adapter)
 
 
-def fetch_tdx_json(url: str, headers: dict, retries: int = 2):
+def fetch_tdx_json(url: str, headers: dict, retries: int = 3):
     for attempt in range(retries + 1):
-        res = http_session.get(url, headers=headers, timeout=12)
+        res = http_session.get(url, headers=headers, timeout=15)
         if res.status_code == 429 and attempt < retries:
-            time.sleep(0.8 * (attempt + 1))
+            time.sleep(1.2 * (attempt + 1))
             continue
         res.raise_for_status()
         return res.json()
@@ -53,6 +52,9 @@ TW_TZ = timezone(timedelta(hours=8))
 token_cache = {"access_token": None, "expires_at": 0}
 route_cache = {}
 refreshing_keys = set()
+inflight_locks = {}
+inflight_meta_lock = threading.Lock()
+
 timetable_cache = {}
 schedule_cache = {}
 stops_cache = {}
@@ -60,6 +62,13 @@ stop_routes_cache = {}
 city_network_cache = {}
 city_stops_geo_cache = {}
 youbike_station_cache = {}
+
+
+def _get_route_lock(cache_key: str) -> threading.Lock:
+    with inflight_meta_lock:
+        if cache_key not in inflight_locks:
+            inflight_locks[cache_key] = threading.Lock()
+        return inflight_locks[cache_key]
 
 
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -103,25 +112,137 @@ def build_tdx_url(endpoint: str, city: str, route: str):
 
 def get_stops_cached(city: str, route_name: str, headers: dict):
     key = f"{city}_{route_name}"
-    if key in stops_cache:
+    if key in stops_cache and stops_cache[key]:
         return stops_cache[key]
     url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/StopOfRoute/City/{city}/{route_name}?$select=Direction,Stops&$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
     data = fetch_tdx_json(url, headers)
-    stops_cache[key] = data
+    if isinstance(data, list) and len(data) > 0:
+        stops_cache[key] = data
     return data
 
 
 def get_timetable_cached(city: str, route: str, headers: dict):
     today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
     key = f"{city}_{route}_{today}"
-    if key in timetable_cache:
+    if key in timetable_cache and timetable_cache[key]:
         return timetable_cache[key]
-    res = http_session.get(
-        build_tdx_url("DailyTimetable", city, route), headers=headers, timeout=8
+    try:
+        url = build_tdx_url("DailyTimetable", city, route)
+        data = fetch_tdx_json(url, headers)
+        if isinstance(data, list) and len(data) > 0:
+            timetable_cache[key] = data
+            return data
+    except Exception:
+        pass
+    return []
+
+
+def get_schedule_cached(city: str, route_name: str, headers: dict):
+    cache_key = f"{city}_schedule_{route_name}"
+    now_ts = time.time()
+    if cache_key in schedule_cache and now_ts - schedule_cache[cache_key]["ts"] < 3600:
+        return schedule_cache[cache_key]["payload"]
+
+    raw_schedules = []
+    try:
+        raw_schedules = fetch_tdx_json(
+            build_tdx_url("Schedule", city, route_name), headers
+        )
+    except Exception:
+        raw_schedules = []
+
+    day_keys = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ]
+    result = {
+        "0": {d: {"times": [], "frequencies": []} for d in day_keys},
+        "1": {d: {"times": [], "frequencies": []} for d in day_keys},
+    }
+
+    for item in raw_schedules:
+        d_str = str(item.get("Direction", 0))
+        if d_str not in result:
+            continue
+
+        for tt in item.get("Timetables", []):
+            service_day = tt.get("ServiceDay") or {}
+            st_list = tt.get("StopTimes") or []
+            if not st_list:
+                continue
+            dep_time = (
+                st_list[0].get("DepartureTime")
+                or st_list[0].get("ArrivalTime")
+                or ""
+            )
+            if not dep_time:
+                continue
+            has_day_flag = any(service_day.get(dk, 0) == 1 for dk in day_keys)
+            for dk in day_keys:
+                if service_day.get(dk, 0) == 1 or not has_day_flag:
+                    if dep_time not in result[d_str][dk]["times"]:
+                        result[d_str][dk]["times"].append(dep_time)
+
+        for fq in item.get("Frequencys", []):
+            service_day = fq.get("ServiceDay") or {}
+            start_t = fq.get("StartTime", "")
+            end_t = fq.get("EndTime", "")
+            min_h = fq.get("MinHeadwayMins", "")
+            max_h = fq.get("MaxHeadwayMins", "")
+            if not start_t or not end_t:
+                continue
+            headway_text = (
+                f"{min_h} 分" if min_h == max_h else f"{min_h}～{max_h} 分"
+            )
+            desc = f"{start_t} - {end_t}（約 {headway_text}一班）"
+            has_day_flag = any(service_day.get(dk, 0) == 1 for dk in day_keys)
+            for dk in day_keys:
+                if service_day.get(dk, 0) == 1 or not has_day_flag:
+                    if desc not in result[d_str][dk]["frequencies"]:
+                        result[d_str][dk]["frequencies"].append(desc)
+
+    has_any = any(
+        result[d][dk]["times"] or result[d][dk]["frequencies"]
+        for d in ["0", "1"]
+        for dk in day_keys
     )
-    data = res.json() if res.status_code == 200 else []
-    timetable_cache[key] = data
-    return data
+    if not has_any:
+        daily = get_timetable_cached(city, route_name, headers)
+        for item in daily:
+            d_str = str(item.get("Direction", 0))
+            if d_str not in result:
+                continue
+            for tt in item.get("Timetables", []):
+                st_list = tt.get("StopTimes") or []
+                if not st_list:
+                    continue
+                dep_time = (
+                    st_list[0].get("DepartureTime")
+                    or st_list[0].get("ArrivalTime")
+                    or ""
+                )
+                if dep_time:
+                    for dk in day_keys:
+                        if dep_time not in result[d_str][dk]["times"]:
+                            result[d_str][dk]["times"].append(dep_time)
+
+    for d in ["0", "1"]:
+        for dk in day_keys:
+            result[d][dk]["times"].sort()
+
+    payload = {"routeName": route_name, "directions": result}
+    if any(
+        result[d][dk]["times"] or result[d][dk]["frequencies"]
+        for d in ["0", "1"]
+        for dk in day_keys
+    ):
+        schedule_cache[cache_key] = {"ts": now_ts, "payload": payload}
+    return payload
 
 
 def _compute_accurate_bus_payload(city: str, route_name: str):
@@ -130,11 +251,10 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
     now_tw = datetime.now(TW_TZ)
     headers = {"authorization": f"Bearer {get_token()}", "Accept-Encoding": "gzip"}
 
-    # 精簡欄位 ($select) 大幅減少 TDX 傳輸資料量
     eta_url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/{city}/{route_name}?$select=Direction,StopSequence,EstimateTime,StopStatus,SrcUpdateTime&$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
     near_url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/RealTimeNearStop/City/{city}/{route_name}?$select=Direction,PlateNumb,DutyStatus,StopSequence,StopName&$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         f_stops = executor.submit(get_stops_cached, city, route_name, headers)
         f_eta = executor.submit(fetch_tdx_json, eta_url, headers)
         f_near = executor.submit(fetch_tdx_json, near_url, headers)
@@ -197,10 +317,12 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
             continue
         dir_label = "去程" if d == 0 else "返程"
         for trip in rtt.get("Timetables", []):
-            st = trip.get("StopTimes", [])
+            st = trip.get("StopTimes") or []
             if not st:
                 continue
-            dep_str = st[0].get("DepartureTime", "")
+            dep_str = (
+                st[0].get("DepartureTime") or st[0].get("ArrivalTime") or ""
+            )
             if ":" in dep_str:
                 try:
                     hh, mm = map(int, dep_str.split(":")[:2])
@@ -242,6 +364,39 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
                                 )
                     except ValueError:
                         pass
+
+    # 若 DailyTimetable 沒有資料，自動從 Schedule 班表備援補齊下一班時間
+    if next_origin_dep[0] is None or next_origin_dep[1] is None:
+        sched_payload = get_schedule_cached(city, route_name, headers)
+        day_keys = [
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
+        ]
+        today_dk = day_keys[now_tw.weekday()]
+        sched_dirs = sched_payload.get("directions", {})
+        for d in [0, 1]:
+            if next_origin_dep[d] is None:
+                today_times = (
+                    sched_dirs.get(str(d), {}).get(today_dk, {}).get("times", [])
+                )
+                for t_str in today_times:
+                    if ":" in t_str:
+                        try:
+                            hh, mm = map(int, t_str.split(":")[:2])
+                            dep_mins = hh * 60 + mm
+                            if dep_mins >= now_mins:
+                                next_origin_dep[d] = (
+                                    dep_mins,
+                                    f"{hh:02d}:{mm:02d}",
+                                )
+                                break
+                        except ValueError:
+                            pass
 
     dirs_result = {0: [], 1: []}
     for r in stops_res:
@@ -324,7 +479,8 @@ def _bg_refresh_route(city: str, route_name: str):
         return
     refreshing_keys.add(cache_key)
     try:
-        _compute_accurate_bus_payload(city, route_name)
+        with _get_route_lock(cache_key):
+            _compute_accurate_bus_payload(city, route_name)
     except Exception:
         pass
     finally:
@@ -342,109 +498,33 @@ def get_accurate_bus(city: str, route_name: str):
     now_ts = time.time()
     cached = route_cache.get(cache_key)
 
-    # 15 秒內完全新鮮 -> 0.001 秒直接秒回
     if cached and (now_ts - cached["ts"] < 15):
         return cached["payload"]
 
-    # 15~120 秒內 -> 先秒回舊快取讓使用者不用等，同時在背景執行緒更新最新動態！
     if cached and (now_ts - cached["ts"] < 120):
         threading.Thread(
             target=_bg_refresh_route, args=(city, route_name), daemon=True
         ).start()
         return cached["payload"]
 
-    return _compute_accurate_bus_payload(city, route_name)
+    lock = _get_route_lock(cache_key)
+    with lock:
+        now_after_wait = time.time()
+        cached_after = route_cache.get(cache_key)
+        if cached_after and (now_after_wait - cached_after["ts"] < 15):
+            return cached_after["payload"]
+        try:
+            return _compute_accurate_bus_payload(city, route_name)
+        except Exception as exc:
+            if cached_after:
+                return cached_after["payload"]
+            raise exc
 
 
 @app.get("/api/bus/timetable/{city}/{route_name}")
 def get_route_full_timetable(city: str, route_name: str):
-    cache_key = f"{city}_schedule_{route_name}"
-    now_ts = time.time()
-    if cache_key in schedule_cache and now_ts - schedule_cache[cache_key]["ts"] < 3600:
-        return schedule_cache[cache_key]["payload"]
-
     headers = {"authorization": f"Bearer {get_token()}", "Accept-Encoding": "gzip"}
-    url = build_tdx_url("Schedule", city, route_name)
-    res = http_session.get(url, headers=headers, timeout=15)
-    raw_schedules = res.json() if res.status_code == 200 else []
-
-    day_keys = [
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-        "Sunday",
-    ]
-    result = {
-        "0": {d: {"times": [], "frequencies": []} for d in day_keys},
-        "1": {d: {"times": [], "frequencies": []} for d in day_keys},
-    }
-
-    for item in raw_schedules:
-        d_str = str(item.get("Direction", 0))
-        if d_str not in result:
-            continue
-
-        for tt in item.get("Timetables", []):
-            service_day = tt.get("ServiceDay", {})
-            st_list = tt.get("StopTimes", [])
-            if not st_list:
-                continue
-            dep_time = st_list[0].get("DepartureTime", "")
-            if not dep_time:
-                continue
-            for dk in day_keys:
-                if service_day.get(dk, 0) == 1:
-                    if dep_time not in result[d_str][dk]["times"]:
-                        result[d_str][dk]["times"].append(dep_time)
-
-        for fq in item.get("Frequencys", []):
-            service_day = fq.get("ServiceDay", {})
-            start_t = fq.get("StartTime", "")
-            end_t = fq.get("EndTime", "")
-            min_h = fq.get("MinHeadwayMins", "")
-            max_h = fq.get("MaxHeadwayMins", "")
-            if not start_t or not end_t:
-                continue
-            headway_text = (
-                f"{min_h} 分" if min_h == max_h else f"{min_h}～{max_h} 分"
-            )
-            desc = f"{start_t} - {end_t}（約 {headway_text}一班）"
-            for dk in day_keys:
-                if service_day.get(dk, 0) == 1:
-                    if desc not in result[d_str][dk]["frequencies"]:
-                        result[d_str][dk]["frequencies"].append(desc)
-
-    has_any = any(
-        result[d][dk]["times"] or result[d][dk]["frequencies"]
-        for d in ["0", "1"]
-        for dk in day_keys
-    )
-    if not has_any:
-        daily = get_timetable_cached(city, route_name, headers)
-        for item in daily:
-            d_str = str(item.get("Direction", 0))
-            if d_str not in result:
-                continue
-            for tt in item.get("Timetables", []):
-                st_list = tt.get("StopTimes", [])
-                if not st_list:
-                    continue
-                dep_time = st_list[0].get("DepartureTime", "")
-                if dep_time:
-                    for dk in day_keys:
-                        if dep_time not in result[d_str][dk]["times"]:
-                            result[d_str][dk]["times"].append(dep_time)
-
-    for d in ["0", "1"]:
-        for dk in day_keys:
-            result[d][dk]["times"].sort()
-
-    payload = {"routeName": route_name, "directions": result}
-    schedule_cache[cache_key] = {"ts": now_ts, "payload": payload}
-    return payload
+    return get_schedule_cached(city, route_name, headers)
 
 
 @app.get("/api/bus/stop/{city}/{stop_name}")
