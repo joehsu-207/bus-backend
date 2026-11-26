@@ -7,7 +7,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Taiwan Bus Full Precise API", version="3.0.0")
+app = FastAPI(title="Taiwan Bus Full Precise API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -236,6 +236,64 @@ async def get_bus_accurate(city: str, route_name: str):
         "1": result["1"],
         "missedAlerts": missed_alerts,
         "serverTime": now.isoformat(),
+    }
+
+
+@app.get("/api/bus/positions/{city}/{route_name}")
+async def get_bus_realtime_positions(city: str, route_name: str):
+    """取得路線上所有車輛的即時 GPS 經緯度座標與沿線站牌座標"""
+    now = datetime.now(TW_TZ)
+    pos_url = (
+        f"{TDX_BUS_URL}/RealTimeByFrequency/City/{city}/{route_name}"
+        f"?$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
+    )
+    sor_url = (
+        f"{TDX_BUS_URL}/StopOfRoute/City/{city}/{route_name}"
+        f"?$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
+    )
+
+    pos_list = await fetch_tdx_json(pos_url, ttl=REALTIME_CACHE_TTL)
+    sor_list = await fetch_tdx_json(sor_url, ttl=STATIC_CACHE_TTL)
+
+    buses_out = []
+    for b in pos_list:
+        b_pos = b.get("BusPosition", {})
+        lat = b_pos.get("PositionLat")
+        lon = b_pos.get("PositionLon")
+        if lat is None or lon is None:
+            continue
+        src_dt = parse_iso_tw(b.get("SrcUpdateTime")) or parse_iso_tw(b.get("GPSTime"))
+        buses_out.append({
+            "plate": b.get("PlateNumb", "未知車牌"),
+            "direction": int(b.get("Direction", 0)),
+            "lat": lat,
+            "lon": lon,
+            "speed": b.get("Speed", 0),
+            "azimuth": b.get("Azimuth", 0),
+            "dutyStatus": b.get("DutyStatus", 1),
+            "updateTime": src_dt.strftime("%H:%M:%S") if src_dt else "",
+        })
+
+    stops_by_dir: Dict[str, List[Dict[str, Any]]] = {"0": [], "1": []}
+    for sor in sor_list:
+        d = str(int(sor.get("Direction", 0)))
+        if d in stops_by_dir and not stops_by_dir[d]:
+            for idx, s in enumerate(sor.get("Stops", [])):
+                s_pos = s.get("StopPosition", {})
+                s_lat = s_pos.get("PositionLat")
+                s_lon = s_pos.get("PositionLon")
+                if s_lat is not None and s_lon is not None:
+                    stops_by_dir[d].append({
+                        "seq": s.get("StopSequence", idx + 1),
+                        "name": s.get("StopName", {}).get("Zh_tw", ""),
+                        "lat": s_lat,
+                        "lon": s_lon,
+                    })
+
+    return {
+        "serverTime": now.isoformat(),
+        "buses": buses_out,
+        "stops": stops_by_dir,
     }
 
 
