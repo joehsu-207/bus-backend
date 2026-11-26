@@ -23,23 +23,50 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    status_code = 500
+    msg = f"{type(exc).__name__}: {str(exc)}"
+    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+        if exc.response.status_code == 429:
+            status_code = 429
+            msg = "TDX 交通資料平台目前請求過於頻繁（429 限流），請稍候 3 秒後再按「重新嘗試」"
     return JSONResponse(
-        status_code=500,
-        content={"detail": f"{type(exc).__name__}: {str(exc)}"},
+        status_code=status_code,
+        content={"detail": msg},
         headers={"Access-Control-Allow-Origin": "*"},
     )
 
 
 http_session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
 http_session.mount("https://", adapter)
 
+# 全局 TDX 節流閥：確保每次呼叫 TDX API 至少間隔 0.65 秒，徹底避免 429 QPS 限流
+_tdx_rate_lock = threading.Lock()
+_last_tdx_call_ts = 0.0
+MIN_TDX_INTERVAL_SEC = 0.65
 
-def fetch_tdx_json(url: str, headers: dict, retries: int = 3):
+
+def _tdx_throttle():
+    global _last_tdx_call_ts
+    with _tdx_rate_lock:
+        now = time.monotonic()
+        wait = MIN_TDX_INTERVAL_SEC - (now - _last_tdx_call_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _last_tdx_call_ts = time.monotonic()
+
+
+def fetch_tdx_json(url: str, headers: dict, retries: int = 4):
     for attempt in range(retries + 1):
-        res = http_session.get(url, headers=headers, timeout=15)
+        _tdx_throttle()
+        res = http_session.get(url, headers=headers, timeout=18)
         if res.status_code == 429 and attempt < retries:
-            time.sleep(1.2 * (attempt + 1))
+            retry_after = res.headers.get("Retry-After")
+            try:
+                sleep_sec = max(1.8, float(retry_after)) if retry_after else (1.8 * (attempt + 1))
+            except ValueError:
+                sleep_sec = 1.8 * (attempt + 1)
+            time.sleep(min(sleep_sec, 8.0))
             continue
         res.raise_for_status()
         return res.json()
@@ -110,10 +137,69 @@ def build_tdx_url(endpoint: str, city: str, route: str):
     return f"https://tdx.transportdata.tw/api/basic/v2/Bus/{endpoint}/City/{city}/{route}?$filter=RouteName/Zh_tw eq '{route}'&$format=JSON"
 
 
+def get_city_network_cached(city: str, headers: dict):
+    now_ts = time.time()
+    cached = city_network_cache.get(city)
+    if cached and now_ts - cached["ts"] < 86400:
+        return cached["data"]
+
+    url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/StopOfRoute/City/{city}?$select=RouteName,Direction,Stops&$format=JSON"
+    raw_list = fetch_tdx_json(url, headers)
+
+    route_dir_stops = {}
+    stop_to_routes = {}
+
+    for item in raw_list:
+        r_name = item.get("RouteName", {}).get("Zh_tw", "")
+        direction = item.get("Direction", 0)
+        if not r_name:
+            continue
+        stops_ordered = [
+            s.get("StopName", {}).get("Zh_tw", "")
+            for s in item.get("Stops", [])
+            if s.get("StopName", {}).get("Zh_tw")
+        ]
+        if not stops_ordered:
+            continue
+        rd_key = (r_name, direction)
+        if rd_key not in route_dir_stops:
+            route_dir_stops[rd_key] = stops_ordered
+            for idx, st_name in enumerate(stops_ordered):
+                stop_to_routes.setdefault(st_name, []).append((r_name, direction, idx))
+
+    network = {
+        "route_dir_stops": route_dir_stops,
+        "stop_to_routes": stop_to_routes,
+    }
+    city_network_cache[city] = {"ts": now_ts, "data": network}
+    return network
+
+
 def get_stops_cached(city: str, route_name: str, headers: dict):
     key = f"{city}_{route_name}"
     if key in stops_cache and stops_cache[key]:
         return stops_cache[key]
+
+    # 優先從已快取 24 小時的全城路網中提取站序，省下一次 TDX StopOfRoute API 呼叫
+    if city != "InterCity" and city in city_network_cache:
+        net = city_network_cache[city]["data"]["route_dir_stops"]
+        reconstructed = []
+        for d in [0, 1]:
+            st_names = net.get((route_name, d))
+            if st_names:
+                reconstructed.append(
+                    {
+                        "Direction": d,
+                        "Stops": [
+                            {"StopSequence": idx + 1, "StopName": {"Zh_tw": nm}}
+                            for idx, nm in enumerate(st_names)
+                        ],
+                    }
+                )
+        if reconstructed:
+            stops_cache[key] = reconstructed
+            return reconstructed
+
     url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/StopOfRoute/City/{city}/{route_name}?$select=Direction,Stops&$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
     data = fetch_tdx_json(url, headers)
     if isinstance(data, list) and len(data) > 0:
@@ -128,7 +214,7 @@ def get_timetable_cached(city: str, route: str, headers: dict):
         return timetable_cache[key]
     try:
         url = build_tdx_url("DailyTimetable", city, route)
-        data = fetch_tdx_json(url, headers)
+        data = fetch_tdx_json(url, headers, retries=2)
         if isinstance(data, list) and len(data) > 0:
             timetable_cache[key] = data
             return data
@@ -146,7 +232,7 @@ def get_schedule_cached(city: str, route_name: str, headers: dict):
     raw_schedules = []
     try:
         raw_schedules = fetch_tdx_json(
-            build_tdx_url("Schedule", city, route_name), headers
+            build_tdx_url("Schedule", city, route_name), headers, retries=2
         )
     except Exception:
         raw_schedules = []
@@ -254,7 +340,8 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
     eta_url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/{city}/{route_name}?$select=Direction,StopSequence,EstimateTime,StopStatus,SrcUpdateTime&$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
     near_url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/RealTimeNearStop/City/{city}/{route_name}?$select=Direction,PlateNumb,DutyStatus,StopSequence,StopName&$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    # max_workers=1 搭配 _tdx_throttle() 依序安全請求，完全避免觸發 TDX 429 QPS 上限
+    with ThreadPoolExecutor(max_workers=1) as executor:
         f_stops = executor.submit(get_stops_cached, city, route_name, headers)
         f_eta = executor.submit(fetch_tdx_json, eta_url, headers)
         f_near = executor.submit(fetch_tdx_json, near_url, headers)
@@ -277,11 +364,9 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
             continue
 
         if duty == 2:
-            # DutyStatus == 2 為 TDX 定義之「尚未發車／總站待命車輛」
             if plate and plate not in standby_plates[d]:
                 standby_plates[d].append(plate)
         else:
-            # 已發車營運中車輛（絕對不可當作下一班待發車重複顯示）
             vehicles[d].append(
                 {
                     "plate": plate or "行駛中",
@@ -414,7 +499,6 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
             f"{next_origin_dep[d][1]}發車" if next_origin_dep[d] else ""
         )
 
-        # 排除任何已經在線上行駛中的車牌，僅保留真正於總站待發車的獨立車牌
         active_plate_set = {b["plate"] for b in active_buses}
         pure_standby = [p for p in standby_plates[d] if p not in active_plate_set]
         next_plate_str = pure_standby[0] if pure_standby else ""
@@ -507,10 +591,10 @@ def get_accurate_bus(city: str, route_name: str):
     now_ts = time.time()
     cached = route_cache.get(cache_key)
 
-    if cached and (now_ts - cached["ts"] < 15):
+    if cached and (now_ts - cached["ts"] < 20):
         return cached["payload"]
 
-    if cached and (now_ts - cached["ts"] < 120):
+    if cached and (now_ts - cached["ts"] < 150):
         threading.Thread(
             target=_bg_refresh_route, args=(city, route_name), daemon=True
         ).start()
@@ -520,7 +604,7 @@ def get_accurate_bus(city: str, route_name: str):
     with lock:
         now_after_wait = time.time()
         cached_after = route_cache.get(cache_key)
-        if cached_after and (now_after_wait - cached_after["ts"] < 15):
+        if cached_after and (now_after_wait - cached_after["ts"] < 20):
             return cached_after["payload"]
         try:
             return _compute_accurate_bus_payload(city, route_name)
@@ -542,7 +626,7 @@ def get_other_routes_at_stop(city: str, stop_name: str):
     now_ts = time.time()
     now_tw = datetime.now(TW_TZ)
 
-    if cache_key in stop_routes_cache and now_ts - stop_routes_cache[cache_key]["ts"] < 20:
+    if cache_key in stop_routes_cache and now_ts - stop_routes_cache[cache_key]["ts"] < 25:
         return stop_routes_cache[cache_key]["payload"]
 
     headers = {"authorization": f"Bearer {get_token()}", "Accept-Encoding": "gzip"}
@@ -596,44 +680,6 @@ def get_other_routes_at_stop(city: str, stop_name: str):
     payload = {"stopName": stop_name, "routes": routes_sorted}
     stop_routes_cache[cache_key] = {"ts": now_ts, "payload": payload}
     return payload
-
-
-def get_city_network_cached(city: str, headers: dict):
-    now_ts = time.time()
-    cached = city_network_cache.get(city)
-    if cached and now_ts - cached["ts"] < 86400:
-        return cached["data"]
-
-    url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/StopOfRoute/City/{city}?$select=RouteName,Direction,Stops&$format=JSON"
-    raw_list = fetch_tdx_json(url, headers)
-
-    route_dir_stops = {}
-    stop_to_routes = {}
-
-    for item in raw_list:
-        r_name = item.get("RouteName", {}).get("Zh_tw", "")
-        direction = item.get("Direction", 0)
-        if not r_name:
-            continue
-        stops_ordered = [
-            s.get("StopName", {}).get("Zh_tw", "")
-            for s in item.get("Stops", [])
-            if s.get("StopName", {}).get("Zh_tw")
-        ]
-        if not stops_ordered:
-            continue
-        rd_key = (r_name, direction)
-        if rd_key not in route_dir_stops:
-            route_dir_stops[rd_key] = stops_ordered
-            for idx, st_name in enumerate(stops_ordered):
-                stop_to_routes.setdefault(st_name, []).append((r_name, direction, idx))
-
-    network = {
-        "route_dir_stops": route_dir_stops,
-        "stop_to_routes": stop_to_routes,
-    }
-    city_network_cache[city] = {"ts": now_ts, "data": network}
-    return network
 
 
 def get_city_stops_geo_cached(city: str, headers: dict):
@@ -703,8 +749,7 @@ def get_nearby_youbike(city: str, stop_name: str, radius: int = 300):
         stations_map = cached_st["data"]
     else:
         st_url = f"https://tdx.transportdata.tw/api/basic/v2/Bike/Station/City/{city}?$select=StationUID,StationName,StationPosition&$format=JSON"
-        st_res = http_session.get(st_url, headers=headers, timeout=15)
-        raw_st = st_res.json() if st_res.status_code == 200 else []
+        raw_st = fetch_tdx_json(st_url, headers)
         stations_map = {}
         for item in raw_st:
             uid = item.get("StationUID")
@@ -730,8 +775,7 @@ def get_nearby_youbike(city: str, stop_name: str, radius: int = 300):
         return {"stopName": stop_name, "stations": []}
 
     av_url = f"https://tdx.transportdata.tw/api/basic/v2/Bike/Availability/City/{city}?$select=StationUID,AvailableRentBikes,AvailableReturnBikes,ServiceStatus&$format=JSON"
-    av_res = http_session.get(av_url, headers=headers, timeout=15)
-    raw_av = av_res.json() if av_res.status_code == 200 else []
+    raw_av = fetch_tdx_json(av_url, headers)
 
     results = []
     for av in raw_av:
