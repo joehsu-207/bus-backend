@@ -1,13 +1,16 @@
-import os
-import time
+import asyncio
 import math
+import os
+import re
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional, Tuple
+
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Taiwan Bus Full Precise API", version="3.1.0")
+app = FastAPI(title="Taiwan Bus & YouBike Accurate API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,28 +20,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+TDX_CLIENT_ID = os.getenv("TDX_CLIENT_ID", "")
+TDX_CLIENT_SECRET = os.getenv("TDX_CLIENT_SECRET", "")
+TDX_AUTH_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
+TDX_BASE_URL = "https://tdx.transportdata.tw/api/basic"
+
 TW_TZ = timezone(timedelta(hours=8))
 
-TDX_CLIENT_ID = os.getenv("TDX_CLIENT_ID", "你的_TDX_CLIENT_ID")
-TDX_CLIENT_SECRET = os.getenv("TDX_CLIENT_SECRET", "你的_TDX_CLIENT_SECRET")
-TDX_AUTH_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
-TDX_BUS_URL = "https://tdx.transportdata.tw/api/basic/v2/Bus"
-TDX_BIKE_URL = "https://tdx.transportdata.tw/api/basic/v2/Bike"
+_TOKEN_CACHE: Dict[str, Any] = {"token": None, "expires_at": 0.0}
+_API_CACHE: Dict[str, Dict[str, Any]] = {}
+_YOUBIKE_CACHE: Dict[str, Dict[str, Any]] = {}
+_ROUTE_CACHE_POOL: Dict[str, Dict[str, Any]] = {}
 
-_token_cache: Dict[str, Any] = {"access_token": None, "expires_at": 0.0}
-_api_cache: Dict[str, Dict[str, Any]] = {}
+# 內建臺中常用站點座標備援（避免 TDX 限流時無法計算 YouBike 距離）
+_BUILTIN_STOP_COORDS: Dict[str, Tuple[float, float]] = {
+    "三厝里": (24.15165, 120.63528),
+    "逢甲大學(福星路)": (24.17885, 120.64682),
+    "逢甲大學(逢甲路)": (24.17820, 120.64515),
+    "黎明公益路口": (24.15042, 120.63558),
+    "永春東七公益路口": (24.14895, 120.63112),
+    "台中火車站": (24.13678, 120.68501),
+    "臺中車站": (24.13678, 120.68501),
+}
 
-REALTIME_CACHE_TTL = 12
-STATIC_CACHE_TTL = 3600
+DAY_KEYS = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+]
+
+
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return round(r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+
+
+def _normalize_stop(name: str) -> str:
+    return re.split(r"[\(（]", name)[0].strip()
 
 
 async def get_tdx_token() -> str:
     now = time.time()
-    if _token_cache["access_token"] and now < _token_cache["expires_at"] - 60:
-        return _token_cache["access_token"]
+    if _TOKEN_CACHE["token"] and now < _TOKEN_CACHE["expires_at"] - 60:
+        return _TOKEN_CACHE["token"]
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(
+    if not TDX_CLIENT_ID or not TDX_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="伺服器尚未設定 TDX_CLIENT_ID / TDX_CLIENT_SECRET")
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        res = await client.post(
             TDX_AUTH_URL,
             data={
                 "grant_type": "client_credentials",
@@ -47,299 +85,309 @@ async def get_tdx_token() -> str:
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"TDX Token 取得失敗: {resp.text}")
-        data = resp.json()
-        _token_cache["access_token"] = data["access_token"]
-        _token_cache["expires_at"] = now + data.get("expires_in", 86400)
-        return _token_cache["access_token"]
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail=f"TDX Token 取得失敗: {res.text}")
+        data = res.json()
+        _TOKEN_CACHE["token"] = data["access_token"]
+        _TOKEN_CACHE["expires_at"] = now + int(data.get("expires_in", 86400))
+        return _TOKEN_CACHE["token"]
 
 
-async def fetch_tdx_json(url: str, ttl: int = REALTIME_CACHE_TTL) -> Any:
+async def tdx_get(path: str, params: Optional[Dict[str, Any]] = None, ttl: int = 15) -> Any:
+    query_params = {"$format": "JSON"}
+    if params:
+        query_params.update(params)
+
+    cache_key = f"{path}|{sorted(query_params.items())}"
     now = time.time()
-    if url in _api_cache and (now - _api_cache[url]["timestamp"] < ttl):
-        return _api_cache[url]["data"]
+    cached = _API_CACHE.get(cache_key)
+    if cached and now - cached["ts"] < ttl:
+        return cached["data"]
 
     token = await get_tdx_token()
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(
+    url = f"{TDX_BASE_URL}{path}"
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        res = await client.get(
             url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept-Encoding": "gzip",
-            },
+            params=query_params,
+            headers={"Authorization": f"Bearer {token}"},
         )
-        if resp.status_code == 429 and url in _api_cache:
-            return _api_cache[url]["data"]
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=f"TDX API 錯誤: {resp.text}")
-
-        data = resp.json()
-        _api_cache[url] = {"timestamp": now, "data": data}
+        if res.status_code == 429:
+            if cached:
+                return cached["data"]
+            raise HTTPException(status_code=429, detail="TDX API 查詢頻率達上限 (429)")
+        if res.status_code != 200:
+            if cached:
+                return cached["data"]
+            raise HTTPException(status_code=res.status_code, detail=f"TDX 請求失敗: {res.text}")
+        data = res.json()
+        _API_CACHE[cache_key] = {"ts": now, "data": data}
         return data
-
-
-def parse_iso_tw(dt_str: Optional[str]) -> Optional[datetime]:
-    if not dt_str:
-        return None
-    try:
-        return datetime.fromisoformat(dt_str).astimezone(TW_TZ)
-    except ValueError:
-        return None
-
-
-def compute_precise_rem_sec(item: Dict[str, Any], now: datetime) -> Optional[int]:
-    """扣除 SrcUpdateTime 延遲秒數後的精準剩餘秒數計算"""
-    est = item.get("EstimateTime")
-    if est is None:
-        return None
-    src_dt = parse_iso_tw(item.get("SrcUpdateTime")) or parse_iso_tw(item.get("UpdateTime"))
-    elapsed = max(0, (now - src_dt).total_seconds()) if src_dt else 0
-    return max(0, int(est - elapsed))
-
-
-def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
-    r = 6371000
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return int(2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "server_time": datetime.now(TW_TZ).isoformat()}
+    return {"status": "ok", "service": "Taiwan Bus & YouBike API"}
+
+
+@app.get("/api/youbike/nearby/{city}")
+async def get_nearby_youbike(
+    city: str,
+    stop_name: str = Query(...),
+    radius: int = Query(500),
+):
+    target_lat: Optional[float] = None
+    target_lon: Optional[float] = None
+
+    for k, coords in _BUILTIN_STOP_COORDS.items():
+        if k in stop_name or stop_name in k:
+            target_lat, target_lon = coords
+            break
+
+    # 若內建座標未命中，嘗試從已快取的公車路線池取得站牌經緯度（零 TDX 額度消耗）
+    if target_lat is None:
+        base_target = _normalize_stop(stop_name)
+        for ck, payload in _ROUTE_CACHE_POOL.items():
+            if not ck.startswith(f"{city}_"):
+                continue
+            for dir_key in ("0", "1"):
+                for st in payload.get(dir_key, []):
+                    s_name = st.get("name", "")
+                    if (stop_name in s_name or (base_target and base_target in s_name)) and st.get("lat") and st.get("lon"):
+                        target_lat = float(st["lat"])
+                        target_lon = float(st["lon"])
+                        break
+                if target_lat is not None:
+                    break
+            if target_lat is not None:
+                break
+
+    stations: List[Dict[str, Any]] = []
+    if city == "Taichung":
+        now = time.time()
+        cached = _YOUBIKE_CACHE.get("Taichung")
+        if cached and now - cached["ts"] < 45:
+            records = cached["data"]
+        else:
+            url = "https://newdatacenter.taichung.gov.tw/api/v1/no-auth/resource.download?rid=cab8f056-93e3-4aec-8909-1ba45d2b5d0d"
+            try:
+                async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+                    res = await client.get(url)
+                    res.raise_for_status()
+                    raw = res.json()
+                    records = raw if isinstance(raw, list) else raw.get("retVal", [])
+                    _YOUBIKE_CACHE["Taichung"] = {"ts": now, "data": records}
+            except Exception:
+                records = cached["data"] if cached else []
+
+        base_target = _normalize_stop(stop_name)
+        for item in records:
+            name = str(item.get("sna", "")).replace("YouBike2.0_", "")
+            try:
+                s_lat = float(item.get("lat") or 0)
+                s_lon = float(item.get("lng") or 0)
+                rent = int(item.get("available_rent_bikes") or item.get("sbi") or 0)
+                ret = int(item.get("available_return_bikes") or item.get("bemp") or 0)
+            except (ValueError, TypeError):
+                continue
+
+            if target_lat is not None and target_lon is not None and s_lat and s_lon:
+                dist = _haversine(target_lat, target_lon, s_lat, s_lon)
+                if dist <= radius:
+                    stations.append({
+                        "name": name,
+                        "distanceMeters": dist,
+                        "rentBikes": rent,
+                        "returnSpaces": ret,
+                    })
+            elif (base_target and base_target in name) or (name and name in stop_name):
+                stations.append({
+                    "name": name,
+                    "distanceMeters": 100,
+                    "rentBikes": rent,
+                    "returnSpaces": ret,
+                })
+
+    stations.sort(key=lambda x: x["distanceMeters"])
+    return {"stopName": stop_name, "stations": stations[:6]}
 
 
 @app.get("/api/bus/accurate/{city}/{route_name}")
-async def get_bus_accurate(city: str, route_name: str):
-    now = datetime.now(TW_TZ)
-    eta_url = (
-        f"{TDX_BUS_URL}/EstimatedTimeOfArrival/City/{city}/{route_name}"
-        f"?$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
-    )
-    near_url = (
-        f"{TDX_BUS_URL}/RealTimeNearStop/City/{city}/{route_name}"
-        f"?$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
-    )
-    sor_url = (
-        f"{TDX_BUS_URL}/StopOfRoute/City/{city}/{route_name}"
-        f"?$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
+async def get_accurate_bus(city: str, route_name: str):
+    safe_route = route_name.replace("'", "''")
+    filter_expr = f"RouteName/Zh_tw eq '{safe_route}'"
+
+    stops_data, eta_data, vehicles_data = await asyncio.gather(
+        tdx_get(f"/v2/Bus/StopOfRoute/City/{city}/{route_name}", {"$filter": filter_expr}, ttl=3600),
+        tdx_get(f"/v2/Bus/EstimatedTimeOfArrival/City/{city}/{route_name}", {"$filter": filter_expr}, ttl=12),
+        tdx_get(f"/v2/Bus/RealTimeNearStop/City/{city}/{route_name}", {"$filter": filter_expr}, ttl=12),
     )
 
-    eta_list = await fetch_tdx_json(eta_url, ttl=REALTIME_CACHE_TTL)
-    near_list = await fetch_tdx_json(near_url, ttl=REALTIME_CACHE_TTL)
-    sor_list = await fetch_tdx_json(sor_url, ttl=STATIC_CACHE_TTL)
-
-    result: Dict[str, List[Dict[str, Any]]] = {"0": [], "1": []}
-    missed_alerts: List[str] = []
-
-    eta_by_dir_uid: Dict[tuple, List[Dict[str, Any]]] = {}
-    for item in eta_list:
-        d = int(item.get("Direction", 0))
-        uid = item.get("StopUID", "")
-        eta_by_dir_uid.setdefault((d, uid), []).append(item)
-
-    buses_at_stop: Dict[tuple, List[str]] = {}
-    bus_current_stop_name: Dict[str, str] = {}
-    for b in near_list:
-        d = int(b.get("Direction", 0))
-        uid = b.get("StopUID", "")
-        plate = b.get("PlateNumb", "")
-        s_name = b.get("StopName", {}).get("Zh_tw", "")
-        if plate and s_name:
-            bus_current_stop_name[plate] = s_name
-        if b.get("A2EventType") == 1 and uid and plate:
-            buses_at_stop.setdefault((d, uid), []).append(plate)
-
-    sor_by_dir: Dict[int, List[Dict[str, Any]]] = {}
-    for sor in sor_list:
-        d = int(sor.get("Direction", 0))
-        if d not in sor_by_dir and sor.get("Stops"):
-            sor_by_dir[d] = sor["Stops"]
-
-    for d in (0, 1):
-        stops_raw = sor_by_dir.get(d, [])
-        if not stops_raw:
-            fallback_items = [x for x in eta_list if int(x.get("Direction", 0)) == d]
-            fallback_items.sort(key=lambda x: x.get("StopSequence", 999))
-            stops_raw = [
-                {
-                    "StopUID": x.get("StopUID", ""),
-                    "StopSequence": x.get("StopSequence", idx + 1),
-                    "StopName": x.get("StopName", {}),
-                }
-                for idx, x in enumerate(fallback_items)
-            ]
-
-        for idx, s in enumerate(stops_raw):
-            uid = s.get("StopUID", "")
-            s_name = s.get("StopName", {}).get("Zh_tw", "")
-            seq = s.get("StopSequence", idx + 1)
-            matched_etas = eta_by_dir_uid.get((d, uid), [])
-
-            buses_here = buses_at_stop.get((d, uid), [])
-            active_buses: List[Dict[str, Any]] = []
-            status = 4
-            next_dep = ""
-            next_plate = ""
-
-            for e in matched_etas:
-                st = e.get("StopStatus", 4)
-                if st == 0:
-                    status = 0
-                elif status != 0:
-                    status = st
-
-                rem_sec = compute_precise_rem_sec(e, now)
-                plate = e.get("PlateNumb", "") or ""
-                if st == 0 and rem_sec is not None:
-                    active_buses.append({
-                        "plate": plate or "行駛中",
-                        "remSec": rem_sec,
-                        "currentStop": bus_current_stop_name.get(plate, ""),
-                    })
-
-                nb_dt = parse_iso_tw(e.get("NextBusTime"))
-                if nb_dt and not next_dep:
-                    next_dep = nb_dt.strftime("%H:%M")
-                    next_plate = plate
-
-                for est_item in e.get("Estimates", []):
-                    e_plate = est_item.get("PlateNumb", "")
-                    e_time = est_item.get("EstimateTime")
-                    if e_time is not None and e_plate and not any(x["plate"] == e_plate for x in active_buses):
-                        src_dt = parse_iso_tw(e.get("SrcUpdateTime")) or parse_iso_tw(e.get("UpdateTime"))
-                        elapsed = max(0, (now - src_dt).total_seconds()) if src_dt else 0
-                        active_buses.append({
-                            "plate": e_plate,
-                            "remSec": max(0, int(e_time - elapsed)),
-                            "currentStop": bus_current_stop_name.get(e_plate, ""),
-                        })
-
-            active_buses.sort(key=lambda x: x["remSec"])
-
-            result[str(d)].append({
-                "stopUid": uid,
-                "seq": seq,
-                "name": s_name,
-                "status": status,
-                "busesHere": buses_here,
-                "buses": active_buses,
-                "nextDeparture": next_dep,
-                "nextPlate": next_plate,
+    dir_stops: Dict[str, List[Dict[str, Any]]] = {"0": [], "1": []}
+    for r in stops_data:
+        if r.get("RouteName", {}).get("Zh_tw") != route_name:
+            continue
+        d = str(r.get("Direction", 0))
+        if d not in dir_stops or dir_stops[d]:
+            continue
+        for idx, s in enumerate(r.get("Stops", [])):
+            pos = s.get("StopPosition", {})
+            dir_stops[d].append({
+                "stopUID": s.get("StopUID", ""),
+                "stopID": s.get("StopID", ""),
+                "name": s.get("StopName", {}).get("Zh_tw", ""),
+                "seq": s.get("StopSequence", idx + 1),
+                "lat": pos.get("PositionLat"),
+                "lon": pos.get("PositionLon"),
+                "status": 1,
+                "busesHere": [],
+                "buses": [],
+                "nextDeparture": "",
+                "nextPlate": "",
             })
 
-    return {
-        "0": result["0"],
-        "1": result["1"],
-        "missedAlerts": missed_alerts,
-        "serverTime": now.isoformat(),
-    }
+    buses_at_stop: Dict[Tuple[str, str], List[str]] = {}
+    bus_current_stop: Dict[str, str] = {}
+    for v in vehicles_data:
+        if v.get("RouteName", {}).get("Zh_tw") != route_name:
+            continue
+        d = str(v.get("Direction", 0))
+        plate = v.get("PlateNumb", "")
+        s_uid = v.get("StopUID", "")
+        s_name = v.get("StopName", {}).get("Zh_tw", "")
+        event_type = v.get("A2EventType", 1)
+        if plate and s_name:
+            bus_current_stop[plate] = s_name
+        if plate and s_uid and event_type == 1:
+            buses_at_stop.setdefault((d, s_uid), []).append(plate)
+
+    eta_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for e in eta_data:
+        if e.get("RouteName", {}).get("Zh_tw") != route_name:
+            continue
+        d = str(e.get("Direction", 0))
+        s_uid = e.get("StopUID", "")
+        eta_map[(d, s_uid)] = e
+
+    for d in ("0", "1"):
+        for st in dir_stops[d]:
+            s_uid = st["stopUID"]
+            st["busesHere"] = buses_at_stop.get((d, s_uid), [])
+            e = eta_map.get((d, s_uid))
+            if e:
+                status = e.get("StopStatus", 1)
+                st["status"] = status
+                est = e.get("EstimateTime")
+                plate = e.get("PlateNumb", "")
+                if status == 0 and est is not None:
+                    st["buses"].append({
+                        "plate": plate,
+                        "remSec": int(est),
+                        "currentStop": bus_current_stop.get(plate, ""),
+                    })
+                next_bus_time = e.get("NextBusTime", "")
+                if next_bus_time and "T" in next_bus_time:
+                    st["nextDeparture"] = next_bus_time.split("T")[1][:5]
+                if plate:
+                    st["nextPlate"] = plate
+
+    payload = {"0": dir_stops["0"], "1": dir_stops["1"], "missedAlerts": []}
+    _ROUTE_CACHE_POOL[f"{city}_{route_name}"] = payload
+    return payload
 
 
 @app.get("/api/bus/positions/{city}/{route_name}")
-async def get_bus_realtime_positions(city: str, route_name: str):
-    """取得路線上所有車輛的即時 GPS 經緯度座標與沿線站牌座標"""
-    now = datetime.now(TW_TZ)
-    pos_url = (
-        f"{TDX_BUS_URL}/RealTimeByFrequency/City/{city}/{route_name}"
-        f"?$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
-    )
-    sor_url = (
-        f"{TDX_BUS_URL}/StopOfRoute/City/{city}/{route_name}"
-        f"?$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
+async def get_bus_positions(city: str, route_name: str):
+    safe_route = route_name.replace("'", "''")
+    filter_expr = f"RouteName/Zh_tw eq '{safe_route}'"
+
+    pos_data, stops_data = await asyncio.gather(
+        tdx_get(f"/v2/Bus/RealTimeByFrequency/City/{city}/{route_name}", {"$filter": filter_expr}, ttl=6),
+        tdx_get(f"/v2/Bus/StopOfRoute/City/{city}/{route_name}", {"$filter": filter_expr}, ttl=3600),
     )
 
-    pos_list = await fetch_tdx_json(pos_url, ttl=REALTIME_CACHE_TTL)
-    sor_list = await fetch_tdx_json(sor_url, ttl=STATIC_CACHE_TTL)
-
-    buses_out = []
-    for b in pos_list:
-        b_pos = b.get("BusPosition", {})
+    buses = []
+    for p in pos_data:
+        if p.get("RouteName", {}).get("Zh_tw") != route_name:
+            continue
+        b_pos = p.get("BusPosition", {})
         lat = b_pos.get("PositionLat")
         lon = b_pos.get("PositionLon")
         if lat is None or lon is None:
             continue
-        src_dt = parse_iso_tw(b.get("SrcUpdateTime")) or parse_iso_tw(b.get("GPSTime"))
-        buses_out.append({
-            "plate": b.get("PlateNumb", "未知車牌"),
-            "direction": int(b.get("Direction", 0)),
+        buses.append({
+            "plate": p.get("PlateNumb", ""),
+            "direction": p.get("Direction", 0),
             "lat": lat,
             "lon": lon,
-            "speed": b.get("Speed", 0),
-            "azimuth": b.get("Azimuth", 0),
-            "dutyStatus": b.get("DutyStatus", 1),
-            "updateTime": src_dt.strftime("%H:%M:%S") if src_dt else "",
+            "speed": p.get("Speed", 0),
+            "azimuth": p.get("Azimuth"),
         })
 
     stops_by_dir: Dict[str, List[Dict[str, Any]]] = {"0": [], "1": []}
-    for sor in sor_list:
-        d = str(int(sor.get("Direction", 0)))
-        if d in stops_by_dir and not stops_by_dir[d]:
-            for idx, s in enumerate(sor.get("Stops", [])):
-                s_pos = s.get("StopPosition", {})
-                s_lat = s_pos.get("PositionLat")
-                s_lon = s_pos.get("PositionLon")
-                if s_lat is not None and s_lon is not None:
-                    stops_by_dir[d].append({
-                        "seq": s.get("StopSequence", idx + 1),
-                        "name": s.get("StopName", {}).get("Zh_tw", ""),
-                        "lat": s_lat,
-                        "lon": s_lon,
-                    })
+    for r in stops_data:
+        if r.get("RouteName", {}).get("Zh_tw") != route_name:
+            continue
+        d = str(r.get("Direction", 0))
+        if stops_by_dir.get(d):
+            continue
+        for idx, s in enumerate(r.get("Stops", [])):
+            sp = s.get("StopPosition", {})
+            stops_by_dir[d].append({
+                "seq": s.get("StopSequence", idx + 1),
+                "name": s.get("StopName", {}).get("Zh_tw", ""),
+                "lat": sp.get("PositionLat"),
+                "lon": sp.get("PositionLon"),
+            })
 
-    return {
-        "serverTime": now.isoformat(),
-        "buses": buses_out,
-        "stops": stops_by_dir,
-    }
+    return {"buses": buses, "stops": stops_by_dir}
 
 
 @app.get("/api/bus/timetable/{city}/{route_name}")
 async def get_bus_timetable(city: str, route_name: str):
-    url = (
-        f"{TDX_BUS_URL}/Schedule/City/{city}/{route_name}"
-        f"?$filter=RouteName/Zh_tw eq '{route_name}'&$format=JSON"
-    )
-    schedules = await fetch_tdx_json(url, ttl=STATIC_CACHE_TTL)
+    safe_route = route_name.replace("'", "''")
+    filter_expr = f"RouteName/Zh_tw eq '{safe_route}'"
+    raw_tt = await tdx_get(f"/v2/Bus/Schedule/City/{city}/{route_name}", {"$filter": filter_expr}, ttl=3600)
 
-    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     directions: Dict[str, Dict[str, Dict[str, List[str]]]] = {
-        "0": {day: {"times": [], "frequencies": []} for day in days},
-        "1": {day: {"times": [], "frequencies": []} for day in days},
+        "0": {dk: {"times": [], "frequencies": []} for dk in DAY_KEYS},
+        "1": {dk: {"times": [], "frequencies": []} for dk in DAY_KEYS},
     }
 
-    for sch in schedules:
-        d = str(int(sch.get("Direction", 0)))
+    for item in raw_tt:
+        if item.get("RouteName", {}).get("Zh_tw") != route_name:
+            continue
+        d = str(item.get("Direction", 0))
         if d not in directions:
             continue
-        for tt in sch.get("Timetables", []):
+        for tt in item.get("Timetables", []):
+            service_day = tt.get("ServiceDay", {})
             stop_times = tt.get("StopTimes", [])
-            dep = stop_times[0].get("DepartureTime", "") if stop_times else ""
-            s_day = tt.get("ServiceDay", {})
-            if dep:
-                for day in days:
-                    if s_day.get(day) == 1 and dep not in directions[d][day]["times"]:
-                        directions[d][day]["times"].append(dep)
+            if not stop_times:
+                continue
+            dep = stop_times[0].get("DepartureTime", "")[:5]
+            if not dep:
+                continue
+            for dk in DAY_KEYS:
+                if service_day.get(dk) == 1 and dep not in directions[d][dk]["times"]:
+                    directions[d][dk]["times"].append(dep)
 
-        for fq in sch.get("Frequencys", []):
-            start_t = fq.get("StartTime", "")
-            end_t = fq.get("EndTime", "")
+        for fq in item.get("Frequencies", []):
+            service_day = fq.get("ServiceDay", {})
+            st_time = fq.get("StartTime", "")[:5]
+            ed_time = fq.get("EndTime", "")[:5]
             min_h = fq.get("MinHeadwayMins", "")
             max_h = fq.get("MaxHeadwayMins", "")
-            s_day = fq.get("ServiceDay", {})
-            label = f"{start_t} ~ {end_t}：約 {min_h}~{max_h} 分一班"
-            for day in days:
-                if s_day.get(day) == 1 and label not in directions[d][day]["frequencies"]:
-                    directions[d][day]["frequencies"].append(label)
+            label = f"{st_time}~{ed_time} 約 {min_h}-{max_h} 分一班"
+            for dk in DAY_KEYS:
+                if service_day.get(dk) == 1 and label not in directions[d][dk]["frequencies"]:
+                    directions[d][dk]["frequencies"].append(label)
 
     for d in ("0", "1"):
-        for day in days:
-            directions[d][day]["times"].sort()
+        for dk in DAY_KEYS:
+            directions[d][dk]["times"].sort()
 
-    return {"directions": directions}
+    return {"route": route_name, "directions": directions}
 
 
 @app.get("/api/bus/nearby/{city}")
@@ -349,152 +397,169 @@ async def get_nearby_stops(
     lon: float = Query(...),
     radius: int = Query(450),
 ):
-    url = (
-        f"{TDX_BUS_URL}/Stop/City/{city}"
-        f"?$spatialFilter=nearby({lat},{lon},{radius})&$top=40&$format=JSON"
-    )
-    raw_stops = await fetch_tdx_json(url, ttl=STATIC_CACHE_TTL)
+    spatial_filter = f"nearby(StopPosition, {lat}, {lon}, {radius})"
+    raw_stops = await tdx_get(f"/v2/Bus/Stop/City/{city}", {"$filter": spatial_filter, "$top": 60}, ttl=120)
 
-    by_name: Dict[str, int] = {}
+    seen_names = set()
+    results = []
     for s in raw_stops:
         name = s.get("StopName", {}).get("Zh_tw", "")
-        if not name:
+        if not name or name in seen_names:
             continue
-        s_lat = s.get("StopPosition", {}).get("PositionLat", lat)
-        s_lon = s.get("StopPosition", {}).get("PositionLon", lon)
-        dist = haversine_meters(lat, lon, s_lat, s_lon)
-        if name not in by_name or dist < by_name[name]:
-            by_name[name] = dist
+        sp = s.get("StopPosition", {})
+        s_lat = sp.get("PositionLat")
+        s_lon = sp.get("PositionLon")
+        if s_lat is None or s_lon is None:
+            continue
+        dist = _haversine(lat, lon, float(s_lat), float(s_lon))
+        if dist <= radius:
+            seen_names.add(name)
+            results.append({"name": name, "distanceMeters": dist})
 
-    stops_out = [{"name": k, "distanceMeters": v} for k, v in by_name.items()]
-    stops_out.sort(key=lambda x: x["distanceMeters"])
-    return {"stops": stops_out}
+    results.sort(key=lambda x: x["distanceMeters"])
+    return {"stops": results[:20]}
 
 
 @app.get("/api/bus/stop/{city}/{stop_name}")
 async def get_stop_routes(city: str, stop_name: str):
-    now = datetime.now(TW_TZ)
-    url = (
-        f"{TDX_BUS_URL}/EstimatedTimeOfArrival/City/{city}"
-        f"?$filter=StopName/Zh_tw eq '{stop_name}'&$format=JSON"
+    safe_stop = stop_name.replace("'", "''")
+    eta_list = await tdx_get(
+        f"/v2/Bus/EstimatedTimeOfArrival/City/{city}",
+        {"$filter": f"StopName/Zh_tw eq '{safe_stop}'", "$top": 120},
+        ttl=15,
     )
-    etas = await fetch_tdx_json(url, ttl=REALTIME_CACHE_TTL)
 
     seen = set()
-    routes_out = []
-    for e in etas:
+    routes = []
+    for e in eta_list:
         r_name = e.get("RouteName", {}).get("Zh_tw", "")
-        d = int(e.get("Direction", 0))
-        if not r_name or (r_name, d) in seen:
+        d = e.get("Direction", 0)
+        key = (r_name, d)
+        if not r_name or key in seen:
             continue
-        seen.add((r_name, d))
-        st = e.get("StopStatus", 1)
-        rem_sec = compute_precise_rem_sec(e, now) if st == 0 else None
-        routes_out.append({
+        seen.add(key)
+        status = e.get("StopStatus", 1)
+        est = e.get("EstimateTime")
+        routes.append({
             "routeName": r_name,
             "direction": d,
-            "status": st,
-            "remSec": rem_sec,
+            "status": status,
+            "remSec": int(est) if (status == 0 and est is not None) else None,
         })
 
-    routes_out.sort(key=lambda x: (0 if x["status"] == 0 and x["remSec"] is not None else 1, x["remSec"] or 999999))
-    return {"stopName": stop_name, "routes": routes_out}
+    routes.sort(key=lambda x: (0 if x["status"] == 0 and x["remSec"] is not None else 1, x["remSec"] or 99999))
+    return {"stopName": stop_name, "routes": routes}
 
 
 @app.get("/api/bus/transfer/{city}")
-async def get_transfer_plan(
+async def plan_bus_transfer(
     city: str,
     origin: str = Query(...),
     destination: str = Query(...),
     exclude_route: str = Query(""),
 ):
-    now = datetime.now(TW_TZ)
-    orig_url = (
-        f"{TDX_BUS_URL}/EstimatedTimeOfArrival/City/{city}"
-        f"?$filter=StopName/Zh_tw eq '{origin}'&$format=JSON"
-    )
-    dest_url = (
-        f"{TDX_BUS_URL}/EstimatedTimeOfArrival/City/{city}"
-        f"?$filter=StopName/Zh_tw eq '{destination}'&$format=JSON"
-    )
-    orig_etas = await fetch_tdx_json(orig_url, ttl=REALTIME_CACHE_TTL)
-    dest_etas = await fetch_tdx_json(dest_url, ttl=REALTIME_CACHE_TTL)
+    base_orig = _normalize_stop(origin)
+    base_dest = _normalize_stop(destination)
 
-    dest_map = {
-        (e.get("RouteName", {}).get("Zh_tw", ""), int(e.get("Direction", 0))): e
-        for e in dest_etas
-    }
+    # 1. 先從伺服器快取池掃描可達路線（零 TDX API 額度消耗）
+    direct_results: List[Dict[str, Any]] = []
+    seen_direct = set()
 
-    direct = []
-    for e in orig_etas:
-        r_name = e.get("RouteName", {}).get("Zh_tw", "")
-        d = int(e.get("Direction", 0))
-        if not r_name or (exclude_route and r_name == exclude_route):
+    for ck, payload in list(_ROUTE_CACHE_POOL.items()):
+        if not ck.startswith(f"{city}_"):
             continue
-        if (r_name, d) in dest_map:
-            o_seq = e.get("StopSequence", 0)
-            d_seq = dest_map[(r_name, d)].get("StopSequence", 0)
-            if d_seq >= o_seq:
-                st = e.get("StopStatus", 1)
-                rem_sec = compute_precise_rem_sec(e, now) if st == 0 else None
-                direct.append({
+        r_name = ck[len(city) + 1 :]
+        if exclude_route and r_name == exclude_route:
+            continue
+        for dir_key in ("0", "1"):
+            s_list = payload.get(dir_key, [])
+            orig_idx = -1
+            dest_idx = -1
+            orig_stop_obj = None
+            dest_stop_name = destination
+            for idx, st in enumerate(s_list):
+                s_name = st.get("name", "")
+                if orig_idx == -1 and (origin in s_name or (base_orig and base_orig in s_name)):
+                    orig_idx = idx
+                    orig_stop_obj = st
+                if orig_idx >= 0 and idx > orig_idx and (destination in s_name or (base_dest and base_dest in s_name)):
+                    dest_idx = idx
+                    dest_stop_name = s_name
+                    break
+            if orig_idx >= 0 and dest_idx > orig_idx and orig_stop_obj:
+                d_int = int(dir_key)
+                seen_direct.add((r_name, d_int))
+                buses = orig_stop_obj.get("buses", [])
+                buses_here = orig_stop_obj.get("busesHere", [])
+                rem_sec = 0 if buses_here else (buses[0]["remSec"] if buses else None)
+                status = 0 if (buses_here or buses) else orig_stop_obj.get("status", 1)
+                direct_results.append({
                     "routeName": r_name,
-                    "direction": d,
-                    "status": st,
+                    "direction": d_int,
+                    "originStop": orig_stop_obj.get("name", origin),
+                    "targetStop": dest_stop_name,
+                    "stopsCount": dest_idx - orig_idx,
+                    "status": status,
                     "remSec": rem_sec,
-                    "stopsCount": max(1, d_seq - o_seq),
-                    "targetStop": destination,
                 })
 
-    direct.sort(key=lambda x: (0 if x["status"] == 0 and x["remSec"] is not None else 1, x["remSec"] or 999999))
-    return {"direct": direct, "transfers": []}
+    # 2. 僅使用 2 筆高效率關鍵字過濾請求向 TDX 查詢經過起點與終點的班次，避免觸發 429 限流
+    try:
+        safe_o = base_orig.replace("'", "''")
+        safe_d = base_dest.replace("'", "''")
+        orig_etas, dest_etas = await asyncio.gather(
+            tdx_get(
+                f"/v2/Bus/EstimatedTimeOfArrival/City/{city}",
+                {"$filter": f"contains(StopName/Zh_tw,'{safe_o}')", "$top": 80},
+                ttl=20,
+            ),
+            tdx_get(
+                f"/v2/Bus/EstimatedTimeOfArrival/City/{city}",
+                {"$filter": f"contains(StopName/Zh_tw,'{safe_d}')", "$top": 80},
+                ttl=20,
+            ),
+        )
 
+        orig_by_route: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for e in orig_etas:
+            r_name = e.get("RouteName", {}).get("Zh_tw", "")
+            d = int(e.get("Direction", 0))
+            if not r_name or (exclude_route and r_name == exclude_route):
+                continue
+            orig_by_route[(r_name, d)] = e
 
-@app.get("/api/youbike/nearby/{city}")
-async def get_nearby_youbike(
-    city: str,
-    stop_name: str = Query(...),
-    radius: int = Query(300),
-):
-    stop_url = (
-        f"{TDX_BUS_URL}/Stop/City/{city}"
-        f"?$filter=StopName/Zh_tw eq '{stop_name}'&$top=1&$format=JSON"
+        dest_by_route: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for e in dest_etas:
+            r_name = e.get("RouteName", {}).get("Zh_tw", "")
+            d = int(e.get("Direction", 0))
+            if r_name:
+                dest_by_route[(r_name, d)] = e
+
+        for key, o_e in orig_by_route.items():
+            if key in dest_by_route and key not in seen_direct:
+                d_e = dest_by_route[key]
+                o_seq = o_e.get("StopSequence")
+                d_seq = d_e.get("StopSequence")
+                if o_seq is not None and d_seq is not None and int(d_seq) <= int(o_seq):
+                    continue
+                stops_cnt = (int(d_seq) - int(o_seq)) if (o_seq is not None and d_seq is not None) else 6
+                status = o_e.get("StopStatus", 1)
+                est = o_e.get("EstimateTime")
+                direct_results.append({
+                    "routeName": key[0],
+                    "direction": key[1],
+                    "originStop": o_e.get("StopName", {}).get("Zh_tw", origin),
+                    "targetStop": d_e.get("StopName", {}).get("Zh_tw", destination),
+                    "stopsCount": max(1, stops_cnt),
+                    "status": status,
+                    "remSec": int(est) if (status == 0 and est is not None) else None,
+                })
+                seen_direct.add(key)
+    except HTTPException as exc:
+        if exc.status_code == 429 and not direct_results:
+            raise exc
+
+    direct_results.sort(
+        key=lambda x: (0 if x["status"] == 0 and x["remSec"] is not None else 1, x["remSec"] or 99999)
     )
-    stops = await fetch_tdx_json(stop_url, ttl=STATIC_CACHE_TTL)
-    if not stops:
-        return {"stations": []}
-
-    lat = stops[0].get("StopPosition", {}).get("PositionLat")
-    lon = stops[0].get("StopPosition", {}).get("PositionLon")
-    if lat is None or lon is None:
-        return {"stations": []}
-
-    st_url = (
-        f"{TDX_BIKE_URL}/Station/City/{city}"
-        f"?$spatialFilter=nearby({lat},{lon},{radius})&$format=JSON"
-    )
-    av_url = (
-        f"{TDX_BIKE_URL}/Availability/City/{city}"
-        f"?$spatialFilter=nearby({lat},{lon},{radius})&$format=JSON"
-    )
-    stations = await fetch_tdx_json(st_url, ttl=STATIC_CACHE_TTL)
-    avails = await fetch_tdx_json(av_url, ttl=REALTIME_CACHE_TTL)
-
-    av_map = {a.get("StationUID"): a for a in avails}
-    out = []
-    for st in stations:
-        uid = st.get("StationUID", "")
-        av = av_map.get(uid, {})
-        s_lat = st.get("StationPosition", {}).get("PositionLat", lat)
-        s_lon = st.get("StationPosition", {}).get("PositionLon", lon)
-        dist = haversine_meters(lat, lon, s_lat, s_lon)
-        raw_name = st.get("StationName", {}).get("Zh_tw", "").replace("YouBike2.0_", "")
-        out.append({
-            "name": raw_name,
-            "distanceMeters": dist,
-            "rentBikes": av.get("AvailableRentBikes", 0),
-            "returnSpaces": av.get("AvailableReturnBikes", 0),
-        })
-
-    out.sort(key=lambda x: x["distanceMeters"])
-    return {"stations": out}
+    return {"direct": direct_results, "transfers": []}
