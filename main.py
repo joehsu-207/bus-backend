@@ -107,22 +107,26 @@ async def tdx_get(path: str, params: Optional[Dict[str, Any]] = None, ttl: int =
     token = await get_tdx_token()
     url = f"{TDX_BASE_URL}{path}"
     async with httpx.AsyncClient(timeout=25.0) as client:
-        res = await client.get(
-            url,
-            params=query_params,
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        if res.status_code == 429:
-            if cached:
-                return cached["data"]
-            raise HTTPException(status_code=429, detail="TDX API 查詢頻率達上限 (429)")
-        if res.status_code != 200:
+        for attempt in range(3):
+            res = await client.get(
+                url,
+                params=query_params,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if res.status_code == 200:
+                data = res.json()
+                _API_CACHE[cache_key] = {"ts": now, "data": data}
+                return data
+            if res.status_code == 429:
+                if cached:
+                    return cached["data"]
+                if attempt < 2:
+                    await asyncio.sleep(1.2 * (attempt + 1))
+                    continue
+                raise HTTPException(status_code=429, detail="TDX API 查詢頻率達上限 (429)，請稍候幾秒再試")
             if cached:
                 return cached["data"]
             raise HTTPException(status_code=res.status_code, detail=f"TDX 請求失敗: {res.text}")
-        data = res.json()
-        _API_CACHE[cache_key] = {"ts": now, "data": data}
-        return data
 
 
 @app.get("/")
@@ -144,7 +148,6 @@ async def get_nearby_youbike(
             target_lat, target_lon = coords
             break
 
-    # 若內建座標未命中，嘗試從已快取的公車路線池取得站牌經緯度（零 TDX 額度消耗）
     if target_lat is None:
         base_target = _normalize_stop(stop_name)
         for ck, payload in _ROUTE_CACHE_POOL.items():
@@ -347,7 +350,7 @@ async def get_bus_positions(city: str, route_name: str):
 async def get_bus_timetable(city: str, route_name: str):
     safe_route = route_name.replace("'", "''")
     filter_expr = f"RouteName/Zh_tw eq '{safe_route}'"
-    raw_tt = await tdx_get(f"/v2/Bus/Schedule/City/{city}/{route_name}", {"$filter": filter_expr}, ttl=3600)
+    raw_tt = await tdx_get(f"/v2/Bus/Schedule/City/{city}/{route_name}", {"$filter": filter_expr}, ttl=86400)
 
     directions: Dict[str, Dict[str, Dict[str, List[str]]]] = {
         "0": {dk: {"times": [], "frequencies": []} for dk in DAY_KEYS},
@@ -461,7 +464,6 @@ async def plan_bus_transfer(
     base_orig = _normalize_stop(origin)
     base_dest = _normalize_stop(destination)
 
-    # 1. 先從伺服器快取池掃描可達路線（零 TDX API 額度消耗）
     direct_results: List[Dict[str, Any]] = []
     seen_direct = set()
 
@@ -503,7 +505,6 @@ async def plan_bus_transfer(
                     "remSec": rem_sec,
                 })
 
-    # 2. 僅使用 2 筆高效率關鍵字過濾請求向 TDX 查詢經過起點與終點的班次，避免觸發 429 限流
     try:
         safe_o = base_orig.replace("'", "''")
         safe_d = base_dest.replace("'", "''")
