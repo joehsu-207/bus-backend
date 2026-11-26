@@ -24,12 +24,11 @@ TDX_CLIENT_SECRET = os.getenv("TDX_CLIENT_SECRET", "你的_TDX_CLIENT_SECRET")
 TDX_AUTH_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
 TDX_BASE_URL = "https://tdx.transportdata.tw/api/basic/v2/Bus"
 
-# 多層快取設定（防止 TDX 429 限流）
 _token_cache: Dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 _api_cache: Dict[str, Dict[str, Any]] = {}
 
-REALTIME_CACHE_TTL = 15     # 即時動態快取 15 秒（搭配時間差補償可分秒不差）
-STATIC_CACHE_TTL = 3600     # 路線、站牌、時刻表等靜態資料快取 1 小時
+REALTIME_CACHE_TTL = 15
+STATIC_CACHE_TTL = 3600
 
 
 async def get_tdx_token() -> str:
@@ -93,7 +92,6 @@ def compute_precise_timing(
     now: datetime,
     is_at_stop: bool = False,
 ) -> Dict[str, Any]:
-    """核心精準時間演算法：扣除傳輸/快取延遲，計算真實剩餘秒數與預計到站時刻"""
     stop_status = item.get("StopStatus", 0)
     estimate_sec = item.get("EstimateTime")
     src_dt = parse_iso_tw(item.get("SrcUpdateTime")) or parse_iso_tw(item.get("UpdateTime"))
@@ -166,7 +164,6 @@ async def search_bus_routes(
     city: str = Query("Taichung", description="縣市代碼，例如 Taichung, Taipei"),
     keyword: str = Query("", description="路線關鍵字"),
 ):
-    """1. 取得指定縣市公車路線列表"""
     url = f"{TDX_BASE_URL}/Route/City/{city}?$format=JSON"
     if keyword.strip():
         url += f"&$filter=contains(RouteName/Zh_tw, '{keyword.strip()}')"
@@ -190,7 +187,6 @@ async def get_precise_bus_realtime(
     route_name: str = Query(..., description="路線名稱，例如 54, 358"),
     direction: int = Query(0, description="0=去程, 1=返程"),
 ):
-    """2. 路線即時精準動態（整合預估到站與定點進離站）"""
     now = datetime.now(TW_TZ)
 
     eta_url = (
@@ -210,7 +206,6 @@ async def get_precise_bus_realtime(
     near_list = await fetch_tdx_json(near_url, ttl=REALTIME_CACHE_TTL)
     sor_list = await fetch_tdx_json(stop_of_route_url, ttl=STATIC_CACHE_TTL)
 
-    # 建立標準站序對照表（確保站序完整不漏站）
     ordered_stops: List[Dict[str, Any]] = []
     if sor_list and len(sor_list) > 0:
         for s in sor_list[0].get("Stops", []):
@@ -230,10 +225,9 @@ async def get_precise_bus_realtime(
         if uid:
             near_stop_map[uid] = {
                 "plate_numb": bus.get("PlateNumb", ""),
-                "event_type": bus.get("A2EventType", 0),  # 1=進站, 0=離站
+                "event_type": bus.get("A2EventType", 0),
             }
 
-    # 若 StopOfRoute 無資料則退回使用 eta_list 排序
     if not ordered_stops:
         eta_list.sort(key=lambda x: x.get("StopSequence", 999))
         ordered_stops = [
@@ -265,7 +259,6 @@ async def get_precise_bus_realtime(
 
         timing = compute_precise_timing(eta_item, now, is_at_stop=is_at_stop)
 
-        # 偵測是否剛離站（上一站有離站事件且本站剛變為末班車已過或長時間等待）
         if near_info and near_info["event_type"] == 0:
             missed_bus_detected = True
 
@@ -303,7 +296,6 @@ async def get_nearby_stops(
     lon: float = Query(..., description="經度"),
     radius: int = Query(500, description="搜尋半徑（公尺）"),
 ):
-    """3. 附近站牌與精準公車動態"""
     now = datetime.now(TW_TZ)
     stop_url = (
         f"{TDX_BASE_URL}/Stop/City/{city}"
@@ -356,7 +348,6 @@ async def get_route_timetable(
     route_name: str = Query(...),
     direction: int = Query(0),
 ):
-    """4. 每日發車時刻表查詢"""
     url = (
         f"{TDX_BASE_URL}/Schedule/City/{city}/{route_name}"
         f"?$filter=RouteName/Zh_tw eq '{route_name}' and Direction eq {direction}&$format=JSON"
@@ -391,7 +382,6 @@ async def suggest_transfer_routes(
     stop_name: str = Query(..., description="目前所在站名"),
     exclude_route: str = Query(..., description="剛錯過的路線名稱"),
 ):
-    """5. 錯過班車替代轉乘建議（搜尋同站名其他最快進站路線）"""
     now = datetime.now(TW_TZ)
     eta_url = (
         f"{TDX_BASE_URL}/EstimatedTimeOfArrival/City/{city}"
