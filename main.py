@@ -270,19 +270,25 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
 
     for v in near_res:
         d = v.get("Direction")
-        plate = v.get("PlateNumb", "")
+        plate = v.get("PlateNumb", "").strip()
         duty = v.get("DutyStatus", 0)
-        if d in vehicles:
-            if duty != 2:
-                vehicles[d].append(
-                    {
-                        "plate": plate or "行駛中",
-                        "seq": v.get("StopSequence", 1),
-                        "stopName": v.get("StopName", {}).get("Zh_tw", ""),
-                    }
-                )
+        seq = v.get("StopSequence", 1)
+        if d not in vehicles:
+            continue
+
+        if duty == 2:
+            # DutyStatus == 2 為 TDX 定義之「尚未發車／總站待命車輛」
             if plate and plate not in standby_plates[d]:
                 standby_plates[d].append(plate)
+        else:
+            # 已發車營運中車輛（絕對不可當作下一班待發車重複顯示）
+            vehicles[d].append(
+                {
+                    "plate": plate or "行駛中",
+                    "seq": seq,
+                    "stopName": v.get("StopName", {}).get("Zh_tw", ""),
+                }
+            )
 
     eta_map = {0: {}, 1: {}}
     max_latency = 0
@@ -365,7 +371,6 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
                     except ValueError:
                         pass
 
-    # 若 DailyTimetable 沒有資料，自動從 Schedule 班表備援補齊下一班時間
     if next_origin_dep[0] is None or next_origin_dep[1] is None:
         sched_payload = get_schedule_cached(city, route_name, headers)
         day_keys = [
@@ -408,7 +413,11 @@ def _compute_accurate_bus_payload(city: str, route_name: str):
         origin_next_str = (
             f"{next_origin_dep[d][1]}發車" if next_origin_dep[d] else ""
         )
-        next_plate_str = standby_plates[d][0] if standby_plates[d] else ""
+
+        # 排除任何已經在線上行駛中的車牌，僅保留真正於總站待發車的獨立車牌
+        active_plate_set = {b["plate"] for b in active_buses}
+        pure_standby = [p for p in standby_plates[d] if p not in active_plate_set]
+        next_plate_str = pure_standby[0] if pure_standby else ""
 
         for s in r.get("Stops", []):
             seq = s["StopSequence"]
