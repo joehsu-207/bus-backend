@@ -28,10 +28,11 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 TW_TZ = timezone(timedelta(hours=8))
 
-# 全域快取池，降低 TDX API 呼叫次數避免觸發 429 限制
+# 全域快取池，降低 TDX 與 Overpass API 呼叫次數避免觸發 429 限制
 _token_cache: dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 _api_cache: dict[str, tuple[float, Any]] = {}
 _osm_signal_cache: dict[str, tuple[float, int]] = {}
+_osm_signal_coords_cache: dict[str, tuple[float, list[dict[str, float]]]] = {}
 
 
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -96,7 +97,6 @@ async def tdx_get(
 
     resp = await client.get(url, params=query_params, headers=headers, timeout=20.0)
     if resp.status_code == 429:
-        # 若遭遇 429 且有舊快取，優先回傳舊快取避免前端報錯
         if cache_key in _api_cache:
             return _api_cache[cache_key][1]
         raise HTTPException(status_code=429, detail="TDX API 查詢頻率達上限 (429)")
@@ -111,6 +111,64 @@ async def tdx_get(
     return data
 
 
+async def fetch_osm_signal_coords(
+    client: httpx.AsyncClient,
+    cache_id: str,
+    stops: list[dict[str, Any]],
+) -> list[dict[str, float]]:
+    """取得路線沿線 95 公尺內所有紅綠燈的經緯度座標"""
+    now = time.time()
+    if cache_id in _osm_signal_coords_cache:
+        exp, cached_coords = _osm_signal_coords_cache[cache_id]
+        if now < exp:
+            return cached_coords
+
+    coords = [
+        (float(s["lat"]), float(s["lon"]))
+        for s in stops
+        if s.get("lat") is not None and s.get("lon") is not None
+    ]
+    if len(coords) < 2:
+        return []
+
+    lats = [c[0] for c in coords]
+    lons = [c[1] for c in coords]
+    south, north = min(lats) - 0.002, max(lats) + 0.002
+    west, east = min(lons) - 0.002, max(lons) + 0.002
+
+    if (north - south) > 0.35 or (east - west) > 0.35:
+        return []
+
+    query = f"""
+    [out:json][timeout:6];
+    node["highway"="traffic_signals"]({south:.5f},{west:.5f},{north:.5f},{east:.5f});
+    out body;
+    """
+    try:
+        resp = await client.post(OVERPASS_URL, data={"data": query}, timeout=6.5)
+        if resp.status_code == 200:
+            elements = resp.json().get("elements", [])
+            matched_nodes: dict[int, dict[str, float]] = {}
+            for el in elements:
+                elat = el.get("lat")
+                elon = el.get("lon")
+                eid = el.get("id")
+                if elat is None or elon is None or eid is None:
+                    continue
+                for slat, slon in coords:
+                    if abs(elat - slat) < 0.0012 and abs(elon - slon) < 0.0012:
+                        if haversine_meters(elat, elon, slat, slon) <= 95:
+                            matched_nodes[eid] = {"lat": float(elat), "lon": float(elon)}
+                            break
+            result_list = list(matched_nodes.values())
+            _osm_signal_coords_cache[cache_id] = (now + 86400, result_list)
+            return result_list
+    except Exception:
+        pass
+
+    return []
+
+
 async def fetch_osm_signal_count(
     client: httpx.AsyncClient,
     cache_id: str,
@@ -123,6 +181,12 @@ async def fetch_osm_signal_count(
         if now < exp:
             return count
 
+    signal_nodes = await fetch_osm_signal_coords(client, f"{cache_id}_coords", stops)
+    if signal_nodes:
+        count = len(signal_nodes)
+        _osm_signal_cache[cache_id] = (now + 86400, count)
+        return count
+
     coords = [
         (float(s["lat"]), float(s["lon"]))
         for s in stops
@@ -130,48 +194,6 @@ async def fetch_osm_signal_count(
     ]
     if len(coords) < 2:
         return 0
-
-    lats = [c[0] for c in coords]
-    lons = [c[1] for c in coords]
-    south, north = min(lats) - 0.002, max(lats) + 0.002
-    west, east = min(lons) - 0.002, max(lons) + 0.002
-
-    # 避免過大範圍查詢逾時
-    if (north - south) > 0.35 or (east - west) > 0.35:
-        total_dist = sum(
-            haversine_meters(coords[i][0], coords[i][1], coords[i + 1][0], coords[i + 1][1])
-            for i in range(len(coords) - 1)
-        )
-        est = max(1, round(total_dist / 320.0))
-        _osm_signal_cache[cache_id] = (now + 86400, est)
-        return est
-
-    query = f"""
-    [out:json][timeout:6];
-    node["highway"="traffic_signals"]({south:.5f},{west:.5f},{north:.5f},{east:.5f});
-    out body;
-    """
-    try:
-        resp = await client.post(OVERPASS_URL, data={"data": query}, timeout=6.5)
-        if resp.status_code == 200:
-            elements = resp.json().get("elements", [])
-            matched_ids = set()
-            for el in elements:
-                elat = el.get("lat")
-                elon = el.get("lon")
-                if elat is None or elon is None:
-                    continue
-                for slat, slon in coords:
-                    if abs(elat - slat) < 0.0012 and abs(elon - slon) < 0.0012:
-                        if haversine_meters(elat, elon, slat, slon) <= 95:
-                            matched_ids.add(el.get("id"))
-                            break
-            count = len(matched_ids)
-            if count > 0:
-                _osm_signal_cache[cache_id] = (now + 86400, count)
-                return count
-    except Exception:
-        pass
 
     total_dist = sum(
         haversine_meters(coords[i][0], coords[i][1], coords[i + 1][0], coords[i + 1][1])
@@ -251,7 +273,6 @@ async def get_bus_accurate(city: str, route: str):
         if isinstance(results[0], HTTPException) and not stop_of_route_data:
             raise results[0]
 
-        # 建立車牌 -> 目前所在站名、速度、經緯度對照表
         bus_live_info: dict[str, dict[str, Any]] = {}
         for item in freq_data or []:
             plate = item.get("PlateNumb")
@@ -266,14 +287,13 @@ async def get_bus_accurate(city: str, route: str):
                     "currentStop": "",
                 }
 
-        # 站序 -> 停靠於本站的車輛列表
         buses_at_stop: dict[tuple[int, int], list[str]] = {}
         for item in near_stop_data or []:
             plate = item.get("PlateNumb")
             direction = int(item.get("Direction", 0))
             seq = int(item.get("StopSequence", 0))
             s_name = item.get("StopName", {}).get("Zh_tw") or ""
-            event_type = item.get("A2EventType", 1)  # 1: 進站, 0: 離站
+            event_type = item.get("A2EventType", 1)
             if plate:
                 bus_live_info.setdefault(plate, {"plate": plate, "direction": direction})
                 bus_live_info[plate]["currentStop"] = s_name
@@ -282,7 +302,6 @@ async def get_bus_accurate(city: str, route: str):
                     if plate not in buses_at_stop[(direction, seq)]:
                         buses_at_stop[(direction, seq)].append(plate)
 
-        # 建立 (方向, StopUID/StopSequence) -> ETA 資料對照表
         eta_by_uid: dict[tuple[int, str], dict[str, Any]] = {}
         eta_by_seq: dict[tuple[int, int], dict[str, Any]] = {}
         for item in eta_data or []:
@@ -369,7 +388,7 @@ async def get_bus_accurate(city: str, route: str):
 
 @app.get("/api/bus/positions/{city}/{route}")
 async def get_bus_positions(city: str, route: str):
-    """取得公車即時地圖所需的所有車輛 GPS 座標與站點座標"""
+    """取得公車即時地圖所需的所有車輛 GPS 座標、站點座標與沿線紅綠燈座標"""
     clean_route = route.replace("'", "''")
     filter_expr = f"RouteName/Zh_tw eq '{clean_route}'"
 
@@ -390,25 +409,30 @@ async def get_bus_positions(city: str, route: str):
             return_exceptions=True,
         )
 
-    sr_data = sr_res if not isinstance(sr_res, Exception) else []
-    freq_data = freq_res if not isinstance(freq_res, Exception) else []
+        sr_data = sr_res if not isinstance(sr_res, Exception) else []
+        freq_data = freq_res if not isinstance(freq_res, Exception) else []
 
-    stops_map: dict[str, list[dict[str, Any]]] = {"0": [], "1": []}
-    for sr in sr_data or []:
-        if sr.get("RouteName", {}).get("Zh_tw") != route:
-            continue
-        dir_key = str(int(sr.get("Direction", 0)))
-        if dir_key in stops_map and not stops_map[dir_key]:
-            for st in sr.get("Stops") or []:
-                pos = st.get("StopPosition") or {}
-                stops_map[dir_key].append(
-                    {
-                        "seq": st.get("StopSequence"),
-                        "name": st.get("StopName", {}).get("Zh_tw") or "",
-                        "lat": pos.get("PositionLat"),
-                        "lon": pos.get("PositionLon"),
-                    }
-                )
+        stops_map: dict[str, list[dict[str, Any]]] = {"0": [], "1": []}
+        for sr in sr_data or []:
+            if sr.get("RouteName", {}).get("Zh_tw") != route:
+                continue
+            dir_key = str(int(sr.get("Direction", 0)))
+            if dir_key in stops_map and not stops_map[dir_key]:
+                for st in sr.get("Stops") or []:
+                    pos = st.get("StopPosition") or {}
+                    stops_map[dir_key].append(
+                        {
+                            "seq": st.get("StopSequence"),
+                            "name": st.get("StopName", {}).get("Zh_tw") or "",
+                            "lat": pos.get("PositionLat"),
+                            "lon": pos.get("PositionLon"),
+                        }
+                    )
+
+        sig0_coords, sig1_coords = await asyncio.gather(
+            fetch_osm_signal_coords(client, f"{city}_{route}_0_coords", stops_map["0"]),
+            fetch_osm_signal_coords(client, f"{city}_{route}_1_coords", stops_map["1"]),
+        )
 
     buses_list = []
     for b in freq_data or []:
@@ -430,7 +454,11 @@ async def get_bus_positions(city: str, route: str):
             }
         )
 
-    return {"buses": buses_list, "stops": stops_map}
+    return {
+        "buses": buses_list,
+        "stops": stops_map,
+        "trafficSignals": {"0": sig0_coords, "1": sig1_coords},
+    }
 
 
 @app.get("/api/bus/stop_routes/{city}")
@@ -529,7 +557,6 @@ async def plan_bus_transfer(
             orig_stop_name = o_item.get("StopName", {}).get("Zh_tw") or origin
             dest_stop_name = d_item.get("StopName", {}).get("Zh_tw") or destination
 
-            # 取得該路線完整站序，擷取上車站到下車站之間的所有經過站點
             via_stops = [orig_stop_name, dest_stop_name]
             try:
                 enc_r = r_name.replace("'", "''")
