@@ -9,7 +9,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Taiwan Bus & YouBike Real-time API")
+app = FastAPI(title="Taiwan Bus, YouBike & Weather Real-time API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,14 +25,61 @@ TDX_CLIENT_SECRET = os.getenv("TDX_CLIENT_SECRET", "")
 TDX_AUTH_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
 TDX_BASE_URL = "https://tdx.transportdata.tw/api/basic/v2/Bus"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 TW_TZ = timezone(timedelta(hours=8))
 
-# 全域快取池，降低 TDX 與 Overpass API 呼叫次數避免觸發 429 限制
+# 全域快取池
 _token_cache: dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 _api_cache: dict[str, tuple[float, Any]] = {}
 _osm_signal_cache: dict[str, tuple[float, int]] = {}
 _osm_signal_coords_cache: dict[str, tuple[float, list[dict[str, float]]]] = {}
+_weather_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+# 台灣 22 縣市代表經緯度
+CITY_COORDS: dict[str, tuple[float, float, str]] = {
+    "Taichung": (24.1477, 120.6736, "臺中市"),
+    "Taipei": (25.0330, 121.5654, "臺北市"),
+    "NewTaipei": (25.0169, 121.4628, "新北市"),
+    "Taoyuan": (24.9936, 121.3010, "桃園市"),
+    "Tainan": (22.9999, 120.2269, "臺南市"),
+    "Kaohsiung": (22.6273, 120.3014, "高雄市"),
+    "Keelung": (25.1276, 121.7392, "基隆市"),
+    "Hsinchu": (24.8138, 120.9675, "新竹市"),
+    "HsinchuCounty": (24.8387, 121.0177, "新竹縣"),
+    "MiaoliCounty": (24.5602, 120.8214, "苗栗縣"),
+    "ChanghuaCounty": (24.0518, 120.5161, "彰化縣"),
+    "NantouCounty": (23.9609, 120.9719, "南投縣"),
+    "YunlinCounty": (23.7092, 120.4313, "雲林縣"),
+    "Chiayi": (23.4801, 120.4491, "嘉義市"),
+    "ChiayiCounty": (23.4518, 120.2555, "嘉義縣"),
+    "PingtungCounty": (22.5519, 120.5487, "屏東縣"),
+    "YilanCounty": (24.7021, 121.7377, "宜蘭縣"),
+    "HualienCounty": (23.9871, 121.6015, "花蓮縣"),
+    "TaitungCounty": (22.7972, 121.0713, "臺東縣"),
+    "PenghuCounty": (23.5711, 119.5793, "澎湖縣"),
+    "KinmenCounty": (24.4493, 118.3767, "金門縣"),
+    "LienchiangCounty": (26.1505, 119.9499, "連江縣"),
+}
+
+
+def decode_weather_code(code: int) -> tuple[str, str, bool]:
+    """將 WMO weather_code 轉換為中文描述、圖示類型與是否為雨天"""
+    if code == 0:
+        return ("晴朗", "sunny", False)
+    if code in (1, 2):
+        return ("晴時多雲", "partly_cloudy", False)
+    if code == 3:
+        return ("陰天", "cloudy", False)
+    if code in (45, 48):
+        return ("有霧", "fog", False)
+    if code in (51, 53, 55, 56, 57):
+        return ("毛毛雨", "drizzle", True)
+    if code in (61, 63, 65, 66, 67, 80, 81, 82):
+        return ("陣雨／下雨", "rain", True)
+    if code in (95, 96, 99):
+        return ("雷陣雨", "thunder", True)
+    return ("多雲", "cloudy", False)
 
 
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -220,9 +267,87 @@ def parse_next_departure_str(next_bus_time: str | None) -> str:
 async def root():
     return {
         "status": "ok",
-        "service": "Taiwan Bus & YouBike Real-time API",
+        "service": "Taiwan Bus, YouBike & Weather Real-time API",
         "tdx_auth_configured": bool(TDX_CLIENT_ID and TDX_CLIENT_SECRET),
     }
+
+
+@app.get("/api/weather/{city}")
+async def get_city_weather(city: str):
+    """取得指定縣市的即時氣溫、體感溫度、天氣描述與降雨機率"""
+    now = time.time()
+    if city in _weather_cache:
+        exp, cached = _weather_cache[city]
+        if now < exp:
+            return cached
+
+    lat, lon, city_zh = CITY_COORDS.get(city, (24.1477, 120.6736, "臺中市"))
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,apparent_temperature,precipitation,rain,weather_code,wind_speed_10m",
+        "hourly": "precipitation_probability",
+        "forecast_days": 1,
+        "timezone": "Asia/Taipei",
+    }
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(OPEN_METEO_URL, params=params, timeout=12.0)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="氣象服務暫時無法連線")
+        raw = resp.json()
+
+    curr = raw.get("current") or {}
+    temp = round(float(curr.get("temperature_2m", 24.0)))
+    apparent = round(float(curr.get("apparent_temperature", temp)))
+    w_code = int(curr.get("weather_code", 1))
+    wind = round(float(curr.get("wind_speed_10m", 0.0)), 1)
+    precip = float(curr.get("precipitation", 0.0))
+
+    # 取得目前小時對應的降雨機率
+    rain_prob = 0
+    hourly = raw.get("hourly") or {}
+    times = hourly.get("time") or []
+    probs = hourly.get("precipitation_probability") or []
+    curr_time_str = str(curr.get("time") or "")[:13]
+    for i, t_str in enumerate(times):
+        if str(t_str).startswith(curr_time_str) and i < len(probs) and probs[i] is not None:
+            rain_prob = int(probs[i])
+            break
+    if rain_prob == 0 and probs:
+        valid_probs = [int(p) for p in probs[:6] if p is not None]
+        if valid_probs:
+            rain_prob = max(valid_probs)
+
+    desc, icon_type, is_rainy = decode_weather_code(w_code)
+    if precip > 0 or rain_prob >= 60:
+        is_rainy = True
+
+    advice = (
+        "雨天路滑且車流較慢，建議攜帶雨具並提早 5 分鐘出門"
+        if is_rainy
+        else (
+            "降雨機率偏高，建議隨身攜帶摺疊傘"
+            if rain_prob >= 40
+            else "天氣穩定適合搭車與騎乘 YouBike"
+        )
+    )
+
+    payload = {
+        "city": city,
+        "cityName": city_zh,
+        "temp": temp,
+        "apparentTemp": apparent,
+        "weatherCode": w_code,
+        "description": desc,
+        "iconType": icon_type,
+        "rainProb": rain_prob,
+        "windSpeed": wind,
+        "isRainy": is_rainy,
+        "advice": advice,
+    }
+    _weather_cache[city] = (now + 600, payload)
+    return payload
 
 
 @app.get("/api/bus/accurate/{city}/{route}")
@@ -463,7 +588,7 @@ async def get_bus_positions(city: str, route: str):
 
 @app.get("/api/bus/stop_routes/{city}")
 async def get_stop_routes(city: str, stop_name: str = Query(...)):
-    """查詢經過指定站牌的所有公車路線與預估到站時間（支援點擊中途站轉乘查詢）"""
+    """查詢經過指定站牌的所有公車路線與預估到站時間"""
     clean_stop = stop_name.replace("'", "''")
     async with httpx.AsyncClient() as client:
         etas = await tdx_get(
