@@ -9,7 +9,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Taiwan Bus, YouBike & Weather Real-time API")
+app = FastAPI(title="Taiwan Bus, YouBike, Weather & Telemetry API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,14 +29,15 @@ OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 TW_TZ = timezone(timedelta(hours=8))
 
-# 全域快取池
+# 全域快取與遙測歷史池
 _token_cache: dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 _api_cache: dict[str, tuple[float, Any]] = {}
 _osm_signal_cache: dict[str, tuple[float, int]] = {}
 _osm_signal_coords_cache: dict[str, tuple[float, list[dict[str, float]]]] = {}
 _weather_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+# 車輛位移歷史: plate -> {"lat": float, "lon": float, "since": float, "last_seen": float}
+_bus_motion_history: dict[str, dict[str, float]] = {}
 
-# 台灣 22 縣市代表經緯度
 CITY_COORDS: dict[str, tuple[float, float, str]] = {
     "Taichung": (24.1477, 120.6736, "臺中市"),
     "Taipei": (25.0330, 121.5654, "臺北市"),
@@ -64,7 +65,6 @@ CITY_COORDS: dict[str, tuple[float, float, str]] = {
 
 
 def decode_weather_code(code: int) -> tuple[str, str, bool]:
-    """將 WMO weather_code 轉換為中文描述、圖示類型與是否為雨天"""
     if code == 0:
         return ("晴朗", "sunny", False)
     if code in (1, 2):
@@ -93,6 +93,48 @@ def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
         * math.sin(d_lon / 2) ** 2
     )
     return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def update_and_check_bus_telemetry(
+    plate: str,
+    lat: float | None,
+    lon: float | None,
+    speed: float | int | None,
+) -> dict[str, Any]:
+    """比對車輛連續 GPS 位移與車速，偵測疑似塞車卡死或幽靈公車"""
+    if not plate or lat is None or lon is None:
+        return {"isStuck": False, "stuckMinutes": 0}
+
+    now = time.time()
+    spd = float(speed or 0.0)
+    prev = _bus_motion_history.get(plate)
+
+    if prev is None or (now - prev["last_seen"]) > 900:
+        _bus_motion_history[plate] = {
+            "lat": float(lat),
+            "lon": float(lon),
+            "since": now,
+            "last_seen": now,
+        }
+        return {"isStuck": False, "stuckMinutes": 0}
+
+    moved_meters = haversine_meters(prev["lat"], prev["lon"], float(lat), float(lon))
+    if moved_meters >= 18.0 or spd > 3.0:
+        _bus_motion_history[plate] = {
+            "lat": float(lat),
+            "lon": float(lon),
+            "since": now,
+            "last_seen": now,
+        }
+        return {"isStuck": False, "stuckMinutes": 0}
+
+    prev["last_seen"] = now
+    stuck_sec = now - prev["since"]
+    stuck_mins = int(stuck_sec // 60)
+    return {
+        "isStuck": stuck_sec >= 210,
+        "stuckMinutes": stuck_mins,
+    }
 
 
 async def get_tdx_token(client: httpx.AsyncClient) -> str | None:
@@ -163,7 +205,6 @@ async def fetch_osm_signal_coords(
     cache_id: str,
     stops: list[dict[str, Any]],
 ) -> list[dict[str, float]]:
-    """取得路線沿線 95 公尺內所有紅綠燈的經緯度座標"""
     now = time.time()
     if cache_id in _osm_signal_coords_cache:
         exp, cached_coords = _osm_signal_coords_cache[cache_id]
@@ -221,7 +262,6 @@ async def fetch_osm_signal_count(
     cache_id: str,
     stops: list[dict[str, Any]],
 ) -> int:
-    """透過 OpenStreetMap Overpass API 計算路線沿線經過的交通號誌（紅綠燈）數量"""
     now = time.time()
     if cache_id in _osm_signal_cache:
         exp, count = _osm_signal_cache[cache_id]
@@ -267,14 +307,13 @@ def parse_next_departure_str(next_bus_time: str | None) -> str:
 async def root():
     return {
         "status": "ok",
-        "service": "Taiwan Bus, YouBike & Weather Real-time API",
+        "service": "Taiwan Bus, YouBike, Weather & Telemetry API",
         "tdx_auth_configured": bool(TDX_CLIENT_ID and TDX_CLIENT_SECRET),
     }
 
 
 @app.get("/api/weather/{city}")
 async def get_city_weather(city: str):
-    """取得指定縣市的即時氣溫、體感溫度、天氣描述與降雨機率"""
     now = time.time()
     if city in _weather_cache:
         exp, cached = _weather_cache[city]
@@ -304,7 +343,6 @@ async def get_city_weather(city: str):
     wind = round(float(curr.get("wind_speed_10m", 0.0)), 1)
     precip = float(curr.get("precipitation", 0.0))
 
-    # 取得目前小時對應的降雨機率
     rain_prob = 0
     hourly = raw.get("hourly") or {}
     times = hourly.get("time") or []
@@ -352,7 +390,6 @@ async def get_city_weather(city: str):
 
 @app.get("/api/bus/accurate/{city}/{route}")
 async def get_bus_accurate(city: str, route: str):
-    """取得指定路線去返程站序、即時到站秒數、車牌、目前所在站牌與沿線紅綠燈數"""
     clean_route = route.replace("'", "''")
     filter_expr = f"RouteName/Zh_tw eq '{clean_route}'"
 
@@ -402,14 +439,20 @@ async def get_bus_accurate(city: str, route: str):
         for item in freq_data or []:
             plate = item.get("PlateNumb")
             pos = item.get("BusPosition") or {}
+            lat = pos.get("PositionLat")
+            lon = pos.get("PositionLon")
+            speed = item.get("Speed", 0)
             if plate:
+                telemetry = update_and_check_bus_telemetry(plate, lat, lon, speed)
                 bus_live_info[plate] = {
                     "plate": plate,
                     "direction": item.get("Direction", 0),
-                    "speed": item.get("Speed", 0),
-                    "lat": pos.get("PositionLat"),
-                    "lon": pos.get("PositionLon"),
+                    "speed": speed,
+                    "lat": lat,
+                    "lon": lon,
                     "currentStop": "",
+                    "isStuck": telemetry["isStuck"],
+                    "stuckMinutes": telemetry["stuckMinutes"],
                 }
 
         buses_at_stop: dict[tuple[int, int], list[str]] = {}
@@ -420,7 +463,15 @@ async def get_bus_accurate(city: str, route: str):
             s_name = item.get("StopName", {}).get("Zh_tw") or ""
             event_type = item.get("A2EventType", 1)
             if plate:
-                bus_live_info.setdefault(plate, {"plate": plate, "direction": direction})
+                bus_live_info.setdefault(
+                    plate,
+                    {
+                        "plate": plate,
+                        "direction": direction,
+                        "isStuck": False,
+                        "stuckMinutes": 0,
+                    },
+                )
                 bus_live_info[plate]["currentStop"] = s_name
                 if event_type == 1:
                     buses_at_stop.setdefault((direction, seq), [])
@@ -452,7 +503,7 @@ async def get_bus_accurate(city: str, route: str):
 
             raw_stops = sr.get("Stops") or []
             parsed_stops = []
-            for st in raw_stops:
+            for idx_st, st in enumerate(raw_stops):
                 seq = int(st.get("StopSequence", 0))
                 s_uid = st.get("StopUID") or ""
                 s_name = st.get("StopName", {}).get("Zh_tw") or "未知站牌"
@@ -470,6 +521,8 @@ async def get_bus_accurate(city: str, route: str):
                 approaching_buses = []
                 if est_sec is not None:
                     b_detail = bus_live_info.get(plate, {})
+                    # 排除起站待命發車誤判為塞車
+                    is_stuck = bool(b_detail.get("isStuck", False)) and idx_st > 1
                     approaching_buses.append(
                         {
                             "plate": plate or "行駛中",
@@ -478,6 +531,8 @@ async def get_bus_accurate(city: str, route: str):
                             "speed": b_detail.get("speed"),
                             "lat": b_detail.get("lat"),
                             "lon": b_detail.get("lon"),
+                            "isStuck": is_stuck,
+                            "stuckMinutes": b_detail.get("stuckMinutes", 0) if is_stuck else 0,
                         }
                     )
 
@@ -513,7 +568,6 @@ async def get_bus_accurate(city: str, route: str):
 
 @app.get("/api/bus/positions/{city}/{route}")
 async def get_bus_positions(city: str, route: str):
-    """取得公車即時地圖所需的所有車輛 GPS 座標、站點座標與沿線紅綠燈座標"""
     clean_route = route.replace("'", "''")
     filter_expr = f"RouteName/Zh_tw eq '{clean_route}'"
 
@@ -568,14 +622,19 @@ async def get_bus_positions(city: str, route: str):
         lon = pos.get("PositionLon")
         if lat is None or lon is None:
             continue
+        plate = b.get("PlateNumb") or "未知"
+        speed = b.get("Speed", 0)
+        telemetry = update_and_check_bus_telemetry(plate, lat, lon, speed)
         buses_list.append(
             {
-                "plate": b.get("PlateNumb") or "未知",
+                "plate": plate,
                 "direction": int(b.get("Direction", 0)),
                 "lat": lat,
                 "lon": lon,
-                "speed": b.get("Speed", 0),
+                "speed": speed,
                 "azimuth": b.get("Azimuth", 0),
+                "isStuck": telemetry["isStuck"],
+                "stuckMinutes": telemetry["stuckMinutes"],
             }
         )
 
@@ -588,7 +647,6 @@ async def get_bus_positions(city: str, route: str):
 
 @app.get("/api/bus/stop_routes/{city}")
 async def get_stop_routes(city: str, stop_name: str = Query(...)):
-    """查詢經過指定站牌的所有公車路線與預估到站時間"""
     clean_stop = stop_name.replace("'", "''")
     async with httpx.AsyncClient() as client:
         etas = await tdx_get(
@@ -638,7 +696,6 @@ async def plan_bus_transfer(
     destination: str = Query(...),
     exclude_route: str = Query(""),
 ):
-    """智慧路線規劃：搜尋直達公車、沿途經過站點 (viaStops) 與到站時間"""
     clean_orig = origin.replace("'", "''")
     clean_dest = destination.replace("'", "''")
 
@@ -732,7 +789,6 @@ async def get_nearby_stops(
     lon: float = Query(...),
     radius: int = Query(600),
 ):
-    """搜尋 GPS 座標周邊指定半徑內的公車站牌"""
     async with httpx.AsyncClient() as client:
         stops_data = await tdx_get(
             client,
@@ -768,7 +824,6 @@ async def get_nearby_stops(
 
 @app.get("/api/youbike/{city}")
 async def get_nearby_youbike(city: str, keyword: str = Query("")):
-    """查詢指定關鍵字周邊的 YouBike 2.0 租賃站即時可借車輛與空位"""
     clean_kw = keyword.strip()
     if not clean_kw:
         return {"stations": []}
